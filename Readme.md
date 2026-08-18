@@ -85,4 +85,5 @@ cd ~/projects/android-client
 ```shell
 cd ~/projects/android-client/android
 ./gradlew bundleDebug  -PversionCode=123 -PversionName=1.2.3
+# ./gradlew.bat assembleDebug  -PversionCode=123 -PversionName=1.2.3
 ```
