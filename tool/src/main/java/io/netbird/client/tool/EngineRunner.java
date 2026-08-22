@@ -31,6 +31,7 @@ class EngineRunner {
     private final boolean isDebuggable;
     private final ProfileManagerWrapper profileManager;
     private boolean engineIsRunning = false;
+    private Boolean activeForceRelaySetting;
     Set<ServiceStateListener> serviceStateListeners = ConcurrentHashMap.newKeySet();
     private final Set<Runnable> connectedObservers = ConcurrentHashMap.newKeySet();
     private final Set<ConnectionListener> connectionObservers = ConcurrentHashMap.newKeySet();
@@ -144,12 +145,14 @@ class EngineRunner {
         // update the log levels based on the up to date user settings
         Preferences preferences = new Preferences(context);
         updateLogLevel(preferences.isTraceLogEnabled(), isDebuggable);
+        boolean forceRelaySetting = preferences.isConnectionForceRelayed();
 
         engineIsRunning = true;
+        activeForceRelaySetting = forceRelaySetting;
         Runnable r = () -> {
             DNSWatch dnsWatch = new DNSWatch(context);
 
-            var envList = EnvVarPackager.getEnvironmentVariables(preferences);
+            var envList = EnvVarPackager.getEnvironmentVariables(forceRelaySetting);
 
             // Initialize engine with current active profile
             // Get paths from Go ProfileManager instead of constructing them in Java
@@ -184,7 +187,10 @@ class EngineRunner {
                 Log.e(LOGTAG, "goClient error", e);
                 notifyError(e);
             } finally {
-                engineIsRunning = false;
+                synchronized (EngineRunner.this) {
+                    engineIsRunning = false;
+                    activeForceRelaySetting = null;
+                }
                 dnsWatch.removeDNSChangeListener();
                 notifyServiceStateListeners(false);
             }
@@ -200,6 +206,12 @@ class EngineRunner {
 
     public synchronized boolean isRunning() {
         return engineIsRunning;
+    }
+
+    public synchronized boolean isForceRelaySettingApplied(boolean enabled) {
+        return engineIsRunning
+                && activeForceRelaySetting != null
+                && activeForceRelaySetting == enabled;
     }
 
     public synchronized void setConnectionListener(ConnectionListener listener) {

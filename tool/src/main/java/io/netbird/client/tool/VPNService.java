@@ -8,7 +8,9 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.Binder;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Parcel;
 import android.util.Log;
 
@@ -30,6 +32,8 @@ public class VPNService extends android.net.VpnService {
     private final static String LOGTAG = "service";
     public static final String INTENT_ACTION_START = "io.netbird.client.intent.action.START_SERVICE";
     public static final String ACTION_STOP_ENGINE = "io.netbird.client.intent.action.STOP_ENGINE";
+    public static final String ACTION_APPLY_FORCE_RELAY_SETTING =
+            "io.netbird.client.intent.action.APPLY_FORCE_RELAY_SETTING";
     // Launches MainActivity to run the interactive session-extend flow; set
     // on the persistent notification's "Extend session" action.
     public static final String ACTION_EXTEND_SESSION = "io.netbird.client.intent.action.EXTEND_SESSION";
@@ -42,7 +46,10 @@ public class VPNService extends android.net.VpnService {
     private static final String STATUS_SESSION_EXPIRED = "SessionExpired";
     private static final String STATUS_LOGIN_FAILED = "LoginFailed";
     private final IBinder myBinder = new MyLocalBinder();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable restartEngineRunnable = this::restartEngineIfRequested;
     private EngineRunner engineRunner;
+    private EngineRestartCoordinator engineRestartCoordinator;
     private ForegroundNotification fgNotification;
     private SessionNotification sessionNotification;
     private SessionMonitor sessionMonitor;
@@ -80,6 +87,10 @@ public class VPNService extends android.net.VpnService {
 
         engineRunner = new EngineRunner(this, notifier, tunAdapter, iFaceDiscover, versionName,
                 preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager);
+        engineRestartCoordinator = new EngineRestartCoordinator(
+                engineRunner::isRunning,
+                engineRunner::stop
+        );
 
         // Session tracking lives here, in the service — the Android analogue
         // of the desktop daemon — so warnings and the expired notification
@@ -117,24 +128,36 @@ public class VPNService extends android.net.VpnService {
         // service starts while the device has no network (e.g. airplane mode).
         engineRunner.setNetworkAvailable(networkChangeDetector.hasInternetConnectivity());
 
-        // Register broadcast receiver for stopping engine (e.g., during profile switch)
+        // Register app-internal engine commands. The exported automation
+        // receiver persists the setting, then forwards only this private
+        // apply command while the VPN service is alive.
         stopEngineReceiver = new android.content.BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 if (ACTION_STOP_ENGINE.equals(intent.getAction())) {
                     Log.d(LOGTAG, "Received stop engine broadcast");
-                    if (engineRunner != null) {
-                        engineRunner.stop();
+                    stopEngineAndCancelRestart();
+                    return;
+                }
+                if (ACTION_APPLY_FORCE_RELAY_SETTING.equals(intent.getAction())) {
+                    Log.d(LOGTAG, "Received apply force-relay setting broadcast");
+                    boolean enabled = new Preferences(VPNService.this)
+                            .isConnectionForceRelayed();
+                    if (engineRunner.isForceRelaySettingApplied(enabled)) {
+                        Log.d(LOGTAG, "Force-relay setting is already applied");
+                        return;
                     }
+                    engineRestartCoordinator.requestRestart();
                 }
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_STOP_ENGINE);
+        filter.addAction(ACTION_APPLY_FORCE_RELAY_SETTING);
         androidx.core.content.ContextCompat.registerReceiver(
                 this,
                 stopEngineReceiver,
                 filter,
-                Context.RECEIVER_NOT_EXPORTED
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
         );
     }
 
@@ -175,7 +198,7 @@ public class VPNService extends android.net.VpnService {
     @Override
     public boolean onUnbind(Intent intent) {
         Log.d(LOGTAG, "unbind from activity");
-        if (!engineRunner.isRunning()) {
+        if (!engineRunner.isRunning() && !engineRestartCoordinator.isRestartPending()) {
             stopSelf();
         }
         return false; // false means do not call onRebind
@@ -185,6 +208,11 @@ public class VPNService extends android.net.VpnService {
     public void onDestroy() {
         super.onDestroy();
         Log.d(LOGTAG, "onDestroy");
+
+        mainHandler.removeCallbacks(restartEngineRunnable);
+        if (engineRestartCoordinator != null) {
+            engineRestartCoordinator.cancelRestart();
+        }
 
         // Unregister broadcast receiver
         if (stopEngineReceiver != null) {
@@ -216,7 +244,7 @@ public class VPNService extends android.net.VpnService {
     public void onRevoke() {
         Log.d(LOGTAG, "VPN permission on revoke");
         if (engineRunner != null) {
-            engineRunner.stop();
+            stopEngineAndCancelRestart();
             stopForeground(true);
         }
     }
@@ -240,6 +268,8 @@ public class VPNService extends android.net.VpnService {
         }
 
         public void runEngine(URLOpener urlOpener, boolean isAndroidTV) {
+            engineRestartCoordinator.cancelRestart();
+            mainHandler.removeCallbacks(restartEngineRunnable);
             fgNotification.setState(ForegroundNotification.State.CONNECTING);
             fgNotification.startForeground();
             sessionNotification.cancel();
@@ -247,7 +277,7 @@ public class VPNService extends android.net.VpnService {
         }
 
         public void stopEngine() {
-            engineRunner.stop();
+            stopEngineAndCancelRestart();
         }
 
         public boolean isRunning() {
@@ -469,6 +499,9 @@ public class VPNService extends android.net.VpnService {
                     : ForegroundNotification.State.DISCONNECTED);
             fgNotification.stopForeground();
             sessionMonitor.onStateChanged();
+            if (engineRestartCoordinator.isRestartPending()) {
+                mainHandler.post(restartEngineRunnable);
+            }
         }
 
         @Override
@@ -486,6 +519,37 @@ public class VPNService extends android.net.VpnService {
             fgNotification.stopForeground();
         }
     };
+
+    private void stopEngineAndCancelRestart() {
+        if (engineRestartCoordinator != null) {
+            engineRestartCoordinator.cancelRestart();
+        }
+        mainHandler.removeCallbacks(restartEngineRunnable);
+        if (engineRunner != null) {
+            engineRunner.stop();
+        }
+    }
+
+    private void restartEngineIfRequested() {
+        if (!engineRestartCoordinator.consumeRestart()) {
+            return;
+        }
+        if (engineRunner.isRunning()) {
+            // A manual or always-on start won the race. That new run already
+            // reads the latest preference, so another restart is unnecessary.
+            return;
+        }
+        if (sessionMonitor.isLoginRequired()) {
+            Log.i(LOGTAG, "Force-relay setting saved; reconnect requires login");
+            return;
+        }
+
+        Log.i(LOGTAG, "Restarting engine to apply force-relay setting");
+        fgNotification.setState(ForegroundNotification.State.CONNECTING);
+        fgNotification.startForeground();
+        sessionNotification.cancel();
+        engineRunner.runWithoutAuth();
+    }
 
     private TUNCreatorLooperThread tunCreator;
 

@@ -32,6 +32,12 @@
 
 The NetBird Android client allows connections from mobile devices running Android to private resources in the NetBird network.
 
+## Automation
+
+The global force-relay setting can be changed by other Android apps through a
+broadcast intent. See [Force-relay automation intent](docs/force-relay-intent.md)
+for the Intent contract, Tasker setup, and ADB examples.
+
 ## Screenshots
 
 <p align="center">

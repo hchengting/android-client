@@ -30,12 +30,24 @@ public class Preferences {
         return sharedPref.getBoolean(keyForceRelayConnection, true);
     }
 
+    /**
+     * Stores the force-relay preference and reports whether it changed.
+     */
+    public boolean setConnectionForceRelayed(boolean enabled) {
+        if (isConnectionForceRelayed() == enabled) {
+            return false;
+        }
+
+        sharedPref.edit().putBoolean(keyForceRelayConnection, enabled).apply();
+        return true;
+    }
+
     public void enableForcedRelayConnection() {
-        sharedPref.edit().putBoolean(keyForceRelayConnection, true).apply();
+        setConnectionForceRelayed(true);
     }
 
     public void disableForcedRelayConnection() {
-        sharedPref.edit().putBoolean(keyForceRelayConnection, false).apply();
+        setConnectionForceRelayed(false);
     }
 
     public static String defaultServer() {
