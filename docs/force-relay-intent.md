@@ -2,8 +2,10 @@
 
 NetBird exposes a broadcast intent that changes the global force-relay setting.
 When the VPN engine is running and the value changes, NetBird briefly disconnects
-and reconnects with the new setting. When the engine is stopped, NetBird saves
-the setting and applies it on the next connection without starting the VPN.
+and reconnects its Go engine with the new setting. The Android VPN interface,
+TUN, routes, and foreground service remain active during this internal restart.
+When the engine is stopped, NetBird saves the setting and applies it on the next
+connection without starting the VPN.
 
 > [!WARNING]
 > This initial API is intentionally unprotected. Any installed app can send the
@@ -68,3 +70,14 @@ Create a **Send Intent** action with these fields:
 The initial NetBird registration and Android VPN permission must already be
 complete. If reconnecting requires an interactive login, the setting remains
 saved and NetBird waits for the user to connect normally.
+
+## VPN continuity during reconfiguration
+
+The Go engine restart disconnects management, signal, relay, and peer sessions.
+NetBird retains a duplicate of the Android TUN file descriptor while the old
+engine stops, then gives the replacement engine a new duplicate of the same TUN.
+This keeps the Android VPN network and its routes present throughout the normal
+force-relay reconfiguration path.
+
+See [Runtime force-relay reconfiguration](force-relay-runtime-reconfiguration.md)
+for descriptor ownership, failure handling, and validation details.
