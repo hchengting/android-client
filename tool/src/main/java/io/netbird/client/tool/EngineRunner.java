@@ -20,7 +20,6 @@ import io.netbird.gomobile.android.NetworkChangeListener;
 import io.netbird.gomobile.android.PeerInfoArray;
 import io.netbird.gomobile.android.SSHClient;
 import io.netbird.gomobile.android.StateChangeListener;
-import io.netbird.gomobile.android.TunAdapter;
 import io.netbird.gomobile.android.TunSettings;
 import io.netbird.gomobile.android.URLOpener;
 
@@ -39,12 +38,15 @@ class EngineRunner {
     private final Client goClient;
     private ConnectionListener connectionListener;
 
-    public EngineRunner(Context context, NetworkChangeListener networkChangeListener, TunAdapter tunAdapter,
+    private final IFace tunAdapter;
+
+    public EngineRunner(Context context, NetworkChangeListener networkChangeListener, IFace tunAdapter,
                         IFaceDiscover iFaceDiscover, String versionName, boolean isTraceLogEnabled, boolean isDebuggable,
                         ProfileManagerWrapper profileManager) {
         this.context = context;
         this.isDebuggable = isDebuggable;
         this.profileManager = profileManager;
+        this.tunAdapter = tunAdapter;
 
         goClient = Android.newClient(
                 androidSDKVersion(),
@@ -149,44 +151,39 @@ class EngineRunner {
 
         engineIsRunning = true;
         activeForceRelaySetting = forceRelaySetting;
+        tunAdapter.onEngineRunStarted();
         Runnable r = () -> {
             DNSWatch dnsWatch = new DNSWatch(context);
-
-            var envList = EnvVarPackager.getEnvironmentVariables(forceRelaySetting);
-
-            // Initialize engine with current active profile
-            // Get paths from Go ProfileManager instead of constructing them in Java
-            String configurationFilePath;
-            String stateFilePath;
             try {
-                configurationFilePath = profileManager.getActiveConfigPath();
-                stateFilePath = profileManager.getActiveStateFilePath();
+                var envList = EnvVarPackager.getEnvironmentVariables(forceRelaySetting);
+
+                String configurationFilePath = profileManager.getActiveConfigPath();
+                String stateFilePath = profileManager.getActiveStateFilePath();
                 Profile activeProfile = profileManager.getActiveProfile();
                 Log.d(LOGTAG, "Initializing engine with profile: " + activeProfile);
                 Log.d(LOGTAG, "Config path: " + configurationFilePath);
                 Log.d(LOGTAG, "State path: " + stateFilePath);
-            } catch (Exception e) {
-                Log.e(LOGTAG, "Failed to get profile paths from ProfileManager", e);
-                throw new RuntimeException("Failed to get profile paths: " + e.getMessage(), e);
-            }
 
-            // Create fresh PlatformFiles with current config/state paths
-            // This allows profile switching without recreating the entire Client
-            String cacheDir = context.getCacheDir().getAbsolutePath();
-            var platformFiles = new AndroidPlatformFiles(configurationFilePath, stateFilePath, cacheDir);
-            Log.d(LOGTAG, "Running engine with config: " + configurationFilePath + ", state: " + stateFilePath);
+                String cacheDir = context.getCacheDir().getAbsolutePath();
+                var platformFiles = new AndroidPlatformFiles(
+                        configurationFilePath, stateFilePath, cacheDir);
+                Log.d(LOGTAG, "Running engine with config: " + configurationFilePath
+                        + ", state: " + stateFilePath);
 
-            try {
                 notifyServiceStateListeners(true);
                 if (urlOpener == null) {
-                    goClient.runWithoutLogin(platformFiles, dnsWatch.dnsServers(), () -> dnsWatch.setDNSChangeListener(this::changed), envList);
+                    goClient.runWithoutLogin(platformFiles, dnsWatch.dnsServers(),
+                            () -> dnsWatch.setDNSChangeListener(this::changed), envList);
                 } else {
-                    goClient.run(platformFiles, urlOpener, isAndroidTV, dnsWatch.dnsServers(), () -> dnsWatch.setDNSChangeListener(this::changed), envList);
+                    goClient.run(platformFiles, urlOpener, isAndroidTV,
+                            dnsWatch.dnsServers(),
+                            () -> dnsWatch.setDNSChangeListener(this::changed), envList);
                 }
             } catch (Exception e) {
                 Log.e(LOGTAG, "goClient error", e);
                 notifyError(e);
             } finally {
+                tunAdapter.onEngineStopped();
                 synchronized (EngineRunner.this) {
                     engineIsRunning = false;
                     activeForceRelaySetting = null;
@@ -197,7 +194,14 @@ class EngineRunner {
             Log.e(LOGTAG, "service stopped");
 
         };
-        new Thread(r).start();
+        try {
+            new Thread(r).start();
+        } catch (RuntimeException e) {
+            tunAdapter.onEngineStopped();
+            engineIsRunning = false;
+            activeForceRelaySetting = null;
+            throw e;
+        }
     }
 
     private void changed(DNSList dnsServers) throws Exception {
@@ -353,7 +357,17 @@ class EngineRunner {
     }
 
     public synchronized void stop() {
+        tunAdapter.cancelPreservedEngineRestart();
         goClient.stop();
+    }
+
+    public synchronized void stopPreservingTun() {
+        tunAdapter.preserveForEngineRestart();
+        goClient.stop();
+    }
+
+    public synchronized void cancelPreservedTunRestart() {
+        tunAdapter.cancelPreservedEngineRestart();
     }
 
     public PeerInfoArray peersInfo() {

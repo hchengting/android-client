@@ -22,15 +22,22 @@ class IFace implements TunAdapter {
 
     private static final String LOGTAG = "IFace";
     private final VPNService vpnService;
+    private ParcelFileDescriptor retainedTun;
+    private TUNParameters retainedTunParameters;
+    private final TUNRestartState restartState = new TUNRestartState();
 
     public IFace(VPNService vpnService) {
         this.vpnService = vpnService;
     }
 
     @Override
-    public long configureInterface(String address, String addressV6, long mtu, String dns, String searchDomainsString, String routesString) throws Exception {
+    public synchronized long configureInterface(String address, String addressV6, long mtu,
+                                                String dns, String searchDomainsString,
+                                                String routesString) throws Exception {
         String[] searchDomains = toSearchDomains(searchDomainsString);
         LinkedList<Route> routes = toRoutes(routesString);
+        TUNParameters parameters = new TUNParameters(
+                address, addressV6, mtu, dns, searchDomainsString, routesString);
 
         InetNetwork addr = InetNetwork.parse(address);
         InetNetwork addrV6 = null;
@@ -40,14 +47,22 @@ class IFace implements TunAdapter {
         long fd = -1;
 
         try {
-            fd = createTun(addr.getAddress().getHostAddress(), addr.getMask(), addrV6, (int) mtu, dns, searchDomains, routes);
+            if (canReuseRetainedTun(parameters)) {
+                fd = duplicateRetainedTun();
+                Log.i(LOGTAG, "reusing Android TUN for engine restart");
+            } else {
+                fd = createTun(addr.getAddress().getHostAddress(), addr.getMask(), addrV6,
+                        (int) mtu, dns, searchDomains, routes);
+            }
         } catch (Exception e) {
             Log.e(LOGTAG, "failed to create tunnel", e);
         }
 
-        // only set the currently used TUN parameters if createTun didn't throw exceptions
+        // Publish the configuration only after a TUN descriptor is ready.
         if (fd != -1) {
-            this.vpnService.setCurrentTUNParameters(new TUNParameters(address, addressV6, mtu, dns, searchDomainsString, routesString));
+            retainedTunParameters = parameters;
+            restartState.onTunConfigured();
+            this.vpnService.setCurrentTUNParameters(parameters);
         }
 
         return fd;
@@ -61,7 +76,8 @@ class IFace implements TunAdapter {
         return true;
     }
 
-    private int createTun(String ip, int prefixLength, InetNetwork addrV6, int mtu, String dns, String[] searchDomains, LinkedList<Route> routes) throws Exception {
+    private int createTun(String ip, int prefixLength, InetNetwork addrV6, int mtu, String dns,
+                          String[] searchDomains, LinkedList<Route> routes) throws Exception {
         VpnService.Builder builder = vpnService.getBuilder();
         builder.addAddress(ip, prefixLength);
         if (addrV6 != null) {
@@ -103,7 +119,76 @@ class IFace implements TunAdapter {
             if (tun == null) {
                 throw new BackendException(BackendException.Reason.TUN_CREATION_ERROR);
             }
-            return tun.detachFd();
+            // Go owns and closes the detached descriptor. This duplicate keeps
+            // Android's VPN network alive during an internal engine restart.
+            ParcelFileDescriptor retained = ParcelFileDescriptor.dup(tun.getFileDescriptor());
+            int fd;
+            try {
+                fd = tun.detachFd();
+            } catch (RuntimeException e) {
+                closeTun(retained);
+                throw e;
+            }
+            replaceRetainedTun(retained);
+            return fd;
+        }
+    }
+
+    synchronized void onEngineRunStarted() {
+        restartState.onEngineRunStarted();
+    }
+
+    synchronized void preserveForEngineRestart() {
+        restartState.preserveForRestart();
+    }
+
+    synchronized void cancelPreservedEngineRestart() {
+        restartState.cancel();
+        releaseRetainedTun();
+    }
+
+    synchronized void onEngineStopped() {
+        if (restartState.shouldKeepTunOnEngineStopped()) {
+            return;
+        }
+
+        restartState.cancel();
+        releaseRetainedTun();
+    }
+
+    private boolean canReuseRetainedTun(TUNParameters parameters) {
+        return restartState.canReuseTun(
+                retainedTun != null, retainedTunParameters, parameters);
+    }
+
+    private int duplicateRetainedTun() throws Exception {
+        try (ParcelFileDescriptor duplicate =
+                     ParcelFileDescriptor.dup(retainedTun.getFileDescriptor())) {
+            return duplicate.detachFd();
+        }
+    }
+
+    private void replaceRetainedTun(ParcelFileDescriptor replacement) {
+        ParcelFileDescriptor previous = retainedTun;
+        retainedTun = replacement;
+        closeTun(previous);
+    }
+
+    private void releaseRetainedTun() {
+        ParcelFileDescriptor tun = retainedTun;
+        retainedTun = null;
+        retainedTunParameters = null;
+        closeTun(tun);
+    }
+
+    private void closeTun(ParcelFileDescriptor tun) {
+        if (tun == null) {
+            return;
+        }
+        try {
+            tun.close();
+        } catch (Exception e) {
+            Log.w(LOGTAG, "failed to close retained Android TUN", e);
         }
     }
 

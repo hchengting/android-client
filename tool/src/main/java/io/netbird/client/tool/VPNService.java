@@ -50,6 +50,7 @@ public class VPNService extends android.net.VpnService {
     private final Runnable restartEngineRunnable = this::restartEngineIfRequested;
     private EngineRunner engineRunner;
     private EngineRestartCoordinator engineRestartCoordinator;
+    private IFace iface;
     private ForegroundNotification fgNotification;
     private SessionNotification sessionNotification;
     private SessionMonitor sessionMonitor;
@@ -69,7 +70,7 @@ public class VPNService extends android.net.VpnService {
         Log.d(LOGTAG, "onCreate");
 
         var versionName = Version.getVersionName(this);
-        var tunAdapter = new IFace(this);
+        iface = new IFace(this);
         var iFaceDiscover = new IFaceDiscover();
 
         listener = this::queueTUNRenewal;
@@ -85,11 +86,11 @@ public class VPNService extends android.net.VpnService {
         // Create foreground notification before initializing engine
         fgNotification = new ForegroundNotification(this);
 
-        engineRunner = new EngineRunner(this, notifier, tunAdapter, iFaceDiscover, versionName,
+        engineRunner = new EngineRunner(this, notifier, iface, iFaceDiscover, versionName,
                 preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager);
         engineRestartCoordinator = new EngineRestartCoordinator(
                 engineRunner::isRunning,
-                engineRunner::stop
+                engineRunner::stopPreservingTun
         );
 
         // Session tracking lives here, in the service — the Android analogue
@@ -485,21 +486,21 @@ public class VPNService extends android.net.VpnService {
 
         @Override
         public void onStopped() {
-            // Set before tearing the notification down: stopForeground can
-            // leave the notification on screen briefly (and does leave it when
-            // the service keeps running for a rebind), so it must not linger
-            // showing the connected icon.
-            //
-            // An expired session stops the engine right after onError, so keep
-            // the login prompt instead of overwriting it with a plain
-            // "Disconnected" — the Go side latches NeedsLogin until an actual
-            // login or extend clears it, so this stays true across the stop.
-            fgNotification.setState(sessionMonitor.isLoginRequired()
-                    ? ForegroundNotification.State.NEEDS_LOGIN
-                    : ForegroundNotification.State.DISCONNECTED);
-            fgNotification.stopForeground();
+            boolean restartPending = engineRestartCoordinator.isRestartPending();
+            if (restartPending) {
+                // The service and retained TUN stay alive across this internal
+                // restart, so keep the foreground lifecycle continuous too.
+                fgNotification.setState(ForegroundNotification.State.CONNECTING);
+            } else {
+                // The Go side latches NeedsLogin until a login or session
+                // extension clears it, so preserve that actionable state.
+                fgNotification.setState(sessionMonitor.isLoginRequired()
+                        ? ForegroundNotification.State.NEEDS_LOGIN
+                        : ForegroundNotification.State.DISCONNECTED);
+                fgNotification.stopForeground();
+            }
             sessionMonitor.onStateChanged();
-            if (engineRestartCoordinator.isRestartPending()) {
+            if (restartPending) {
                 mainHandler.post(restartEngineRunnable);
             }
         }
@@ -541,6 +542,10 @@ public class VPNService extends android.net.VpnService {
         }
         if (sessionMonitor.isLoginRequired()) {
             Log.i(LOGTAG, "Force-relay setting saved; reconnect requires login");
+            engineRunner.cancelPreservedTunRestart();
+            fgNotification.setState(ForegroundNotification.State.NEEDS_LOGIN);
+            fgNotification.stopForeground();
+            stopSelf();
             return;
         }
 
@@ -581,7 +586,6 @@ public class VPNService extends android.net.VpnService {
             return;
         }
 
-        var iface = new IFace(VPNService.this);
         try {
             int fd = (int)iface.configureInterface(
                     currentTUNParameters.address,
