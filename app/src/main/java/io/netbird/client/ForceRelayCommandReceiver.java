@@ -33,6 +33,13 @@ public final class ForceRelayCommandReceiver extends BroadcastReceiver {
             return;
         }
 
+        Preferences preferences = new Preferences(context);
+        if (preferences.isForceRelayOnDeviceIdleEnabled()) {
+            Log.i(LOGTAG, "Ignoring force-relay intent while idle automatic mode is enabled");
+            finishOrderedBroadcast(RESULT_UNCHANGED, "ignored_idle_auto_mode");
+            return;
+        }
+
         Boolean enabled = readEnabled(intent);
         if (enabled == null) {
             Log.w(LOGTAG, "Ignoring force-relay intent without a valid ENABLED extra");
@@ -40,7 +47,6 @@ public final class ForceRelayCommandReceiver extends BroadcastReceiver {
             return;
         }
 
-        Preferences preferences = new Preferences(context);
         boolean changed = preferences.setConnectionForceRelayed(enabled);
 
         Intent applyIntent = new Intent(VPNService.ACTION_APPLY_FORCE_RELAY_SETTING);

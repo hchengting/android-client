@@ -65,6 +65,21 @@ public class PreferencesInstrumentedTest {
     }
 
     @Test
+    public void shouldDisableIdleForceRelayByDefault() {
+        Assert.assertFalse(preferences.isForceRelayOnDeviceIdleEnabled());
+    }
+
+    @Test
+    public void shouldPersistIdleForceRelaySetting() {
+        Assert.assertTrue(preferences.setForceRelayOnDeviceIdleEnabled(true));
+        Assert.assertTrue(preferences.isForceRelayOnDeviceIdleEnabled());
+        Assert.assertFalse(preferences.setForceRelayOnDeviceIdleEnabled(true));
+
+        Assert.assertTrue(preferences.setForceRelayOnDeviceIdleEnabled(false));
+        Assert.assertFalse(preferences.isForceRelayOnDeviceIdleEnabled());
+    }
+
+    @Test
     public void shouldReturnFalseWhenTraceLogIsNotSet() {
         Assert.assertFalse(preferences.isTraceLogEnabled());
     }

@@ -7,6 +7,11 @@ TUN, routes, and foreground service remain active during this internal restart.
 When the engine is stopped, NetBird saves the setting and applies it on the next
 connection without starting the VPN.
 
+When **Force relay while device is idle** is enabled, this public command is
+ignored. Automatic idle control owns the effective force-relay value until the
+user disables that mode. An ordered command receives result code `2` and result
+data `ignored_idle_auto_mode` in this case.
+
 > [!WARNING]
 > This initial API is intentionally unprotected. Any installed app can send the
 > broadcast and change this setting or cause a running NetBird tunnel to restart.

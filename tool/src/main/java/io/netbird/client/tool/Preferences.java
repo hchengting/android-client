@@ -9,6 +9,8 @@ public class Preferences {
 
     private final String keyForceRelayConnection = "isConnectionForceRelayed";
 
+    private final String keyForceRelayOnDeviceIdle = "isForceRelayOnDeviceIdleEnabled";
+
     private final SharedPreferences sharedPref;
 
     public Preferences(Context context) {
@@ -48,6 +50,26 @@ public class Preferences {
 
     public void disableForcedRelayConnection() {
         setConnectionForceRelayed(false);
+    }
+
+    public boolean isForceRelayOnDeviceIdleEnabled() {
+        return sharedPref.getBoolean(keyForceRelayOnDeviceIdle, false);
+    }
+
+    /**
+     * Enables or disables automatic force-relay control while the device is idle.
+     *
+     * <p>The UI keeps this mode mutually exclusive with manual force relay. The
+     * effective force-relay preference remains separate because it changes as
+     * the device enters idle mode and the user later unlocks it.</p>
+     */
+    public boolean setForceRelayOnDeviceIdleEnabled(boolean enabled) {
+        if (isForceRelayOnDeviceIdleEnabled() == enabled) {
+            return false;
+        }
+
+        sharedPref.edit().putBoolean(keyForceRelayOnDeviceIdle, enabled).apply();
+        return true;
     }
 
     public static String defaultServer() {

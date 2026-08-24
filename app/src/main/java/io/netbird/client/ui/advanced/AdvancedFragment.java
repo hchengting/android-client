@@ -1,6 +1,7 @@
 package io.netbird.client.ui.advanced;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.util.Log;
@@ -19,6 +20,7 @@ import io.netbird.client.R;
 import io.netbird.client.databinding.FragmentAdvancedBinding;
 import io.netbird.client.tool.Preferences;
 import io.netbird.client.tool.ProfileManagerWrapper;
+import io.netbird.client.tool.VPNService;
 
 
 public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThemeChangedListener {
@@ -28,6 +30,7 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
 
     private FragmentAdvancedBinding binding;
     private io.netbird.gomobile.android.Preferences goPreferences;
+    private boolean updatingForceRelayControls;
 
     private void showReconnectionNeededWarningDialog() {
         final View dialogView = getLayoutInflater().inflate(R.layout.dialog_simple_alert_message, null);
@@ -40,19 +43,95 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
         alertDialog.show();
     }
 
-    private void configureForceRelayConnectionSwitch(@NonNull Preferences preferences) {
-        binding.switchForceRelayConnection.setChecked(preferences.isConnectionForceRelayed());
+    private void configureForceRelayConnectionSwitches(@NonNull Preferences preferences) {
+        boolean automaticModeEnabled = preferences.isForceRelayOnDeviceIdleEnabled();
+        binding.switchForceRelayConnection.setChecked(
+                !automaticModeEnabled && preferences.isConnectionForceRelayed());
+        binding.switchForceRelayOnDeviceIdle.setChecked(automaticModeEnabled);
+        updateForceRelayControlAvailability(preferences);
+
         binding.switchForceRelayConnection.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (updatingForceRelayControls) {
+                return;
+            }
+            if (preferences.isForceRelayOnDeviceIdleEnabled()) {
+                updateForceRelayControlAvailability(preferences);
+                return;
+            }
             if (isChecked) {
                 preferences.enableForcedRelayConnection();
             } else {
                 preferences.disableForcedRelayConnection();
             }
 
+            updateForceRelayControlAvailability(preferences);
             showReconnectionNeededWarningDialog();
         });
 
         binding.layoutForceRelayConnection.setOnClickListener(v -> binding.switchForceRelayConnection.toggle());
+
+        binding.switchForceRelayOnDeviceIdle.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (updatingForceRelayControls) {
+                return;
+            }
+            if (isChecked && preferences.isConnectionForceRelayed()) {
+                // The row is disabled in this state. Keep the invariant even if
+                // accessibility tooling invokes the switch directly.
+                updateForceRelayControlAvailability(preferences);
+                return;
+            }
+
+            preferences.setForceRelayOnDeviceIdleEnabled(isChecked);
+            if (!isChecked) {
+                // Manual force relay was off before automatic mode could be
+                // enabled, so disabling the mode restores that baseline.
+                preferences.setConnectionForceRelayed(false);
+            }
+            updateForceRelayControlAvailability(preferences);
+            requestIdleForceRelayReconciliation();
+        });
+
+        binding.layoutForceRelayOnDeviceIdle.setOnClickListener(
+                v -> binding.switchForceRelayOnDeviceIdle.toggle());
+    }
+
+    private void updateForceRelayControlAvailability(@NonNull Preferences preferences) {
+        boolean automaticModeEnabled = preferences.isForceRelayOnDeviceIdleEnabled();
+        boolean manualModeEnabled = !automaticModeEnabled
+                && preferences.isConnectionForceRelayed();
+
+        updatingForceRelayControls = true;
+        try {
+            binding.switchForceRelayConnection.setChecked(manualModeEnabled);
+            binding.switchForceRelayOnDeviceIdle.setChecked(automaticModeEnabled);
+        } finally {
+            updatingForceRelayControls = false;
+        }
+
+        setSettingRowEnabled(
+                binding.layoutForceRelayConnection,
+                binding.switchForceRelayConnection,
+                !automaticModeEnabled
+        );
+        setSettingRowEnabled(
+                binding.layoutForceRelayOnDeviceIdle,
+                binding.switchForceRelayOnDeviceIdle,
+                automaticModeEnabled || !manualModeEnabled
+        );
+    }
+
+    private void setSettingRowEnabled(@NonNull View row, @NonNull View toggle,
+                                      boolean enabled) {
+        row.setEnabled(enabled);
+        row.setAlpha(enabled ? 1.0f : 0.5f);
+        toggle.setEnabled(enabled);
+    }
+
+    private void requestIdleForceRelayReconciliation() {
+        Context context = requireContext();
+        Intent intent = new Intent(VPNService.ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
+        intent.setPackage(context.getPackageName());
+        context.sendBroadcast(intent);
     }
 
     public View onCreateView(@NonNull LayoutInflater inflater,
@@ -144,7 +223,7 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
 
         binding.layoutRosenpassPermissive.setOnClickListener(v -> binding.switchRosenpassPermissive.toggle());
 
-        configureForceRelayConnectionSwitch(preferences);
+        configureForceRelayConnectionSwitches(preferences);
 
         // Initialize engine config switches (your settings)
         initializeEngineConfigSwitches();

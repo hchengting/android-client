@@ -1,6 +1,7 @@
 package io.netbird.client.tool;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
@@ -12,6 +13,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Parcel;
+import android.os.PowerManager;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -34,6 +36,8 @@ public class VPNService extends android.net.VpnService {
     public static final String ACTION_STOP_ENGINE = "io.netbird.client.intent.action.STOP_ENGINE";
     public static final String ACTION_APPLY_FORCE_RELAY_SETTING =
             "io.netbird.client.intent.action.APPLY_FORCE_RELAY_SETTING";
+    public static final String ACTION_APPLY_IDLE_FORCE_RELAY_SETTING =
+            "io.netbird.client.intent.action.APPLY_IDLE_FORCE_RELAY_SETTING";
     // Launches MainActivity to run the interactive session-extend flow; set
     // on the persistent notification's "Extend session" action.
     public static final String ACTION_EXTEND_SESSION = "io.netbird.client.intent.action.EXTEND_SESSION";
@@ -63,6 +67,7 @@ public class VPNService extends android.net.VpnService {
     private ConcreteNetworkAvailabilityListener networkAvailabilityListener;
     private NetworkSwitchNotifier networkSwitchNotifier;
     private android.content.BroadcastReceiver stopEngineReceiver;
+    private android.content.BroadcastReceiver deviceIdleReceiver;
 
     @Override
     public void onCreate() {
@@ -92,6 +97,7 @@ public class VPNService extends android.net.VpnService {
                 engineRunner::isRunning,
                 engineRunner::stopPreservingTun
         );
+        reconcileIdleForceRelayOnServiceStart();
 
         // Session tracking lives here, in the service — the Android analogue
         // of the desktop daemon — so warnings and the expired notification
@@ -142,23 +148,74 @@ public class VPNService extends android.net.VpnService {
                 }
                 if (ACTION_APPLY_FORCE_RELAY_SETTING.equals(intent.getAction())) {
                     Log.d(LOGTAG, "Received apply force-relay setting broadcast");
-                    boolean enabled = new Preferences(VPNService.this)
-                            .isConnectionForceRelayed();
-                    if (engineRunner.isForceRelaySettingApplied(enabled)) {
-                        Log.d(LOGTAG, "Force-relay setting is already applied");
+                    if (new Preferences(VPNService.this)
+                            .isForceRelayOnDeviceIdleEnabled()) {
+                        Log.d(LOGTAG, "Ignoring manual force-relay apply in idle automatic mode");
                         return;
                     }
-                    engineRestartCoordinator.requestRestart();
+                    reconcileRunningEngineWithStoredForceRelay();
+                    return;
+                }
+                if (ACTION_APPLY_IDLE_FORCE_RELAY_SETTING.equals(intent.getAction())) {
+                    Log.d(LOGTAG, "Received apply idle force-relay setting broadcast");
+                    reconcileIdleForceRelayAfterSettingChanged();
                 }
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_STOP_ENGINE);
         filter.addAction(ACTION_APPLY_FORCE_RELAY_SETTING);
+        filter.addAction(ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
         androidx.core.content.ContextCompat.registerReceiver(
                 this,
                 stopEngineReceiver,
                 filter,
                 androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        );
+
+        // Device idle exits for Doze maintenance windows are deliberately
+        // ignored. Force relay is disabled only after Android reports that the
+        // user is actually present beyond the keyguard.
+        deviceIdleReceiver = new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Preferences currentPreferences = new Preferences(VPNService.this);
+                if (!currentPreferences.isForceRelayOnDeviceIdleEnabled()) {
+                    return;
+                }
+
+                if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(intent.getAction())) {
+                    PowerManager powerManager = getSystemService(PowerManager.class);
+                    if (powerManager == null) {
+                        Log.w(LOGTAG, "PowerManager unavailable for idle force-relay update");
+                        return;
+                    }
+                    boolean deviceIdle = powerManager.isDeviceIdleMode();
+                    applyIdleForceRelayDecision(
+                            IdleForceRelayPolicy.onDeviceIdleModeChanged(
+                                    true, deviceIdle),
+                            deviceIdle
+                                    ? "device entered idle mode"
+                                    : "device idle exit ignored until user unlock"
+                    );
+                    return;
+                }
+
+                if (Intent.ACTION_USER_PRESENT.equals(intent.getAction())) {
+                    applyIdleForceRelayDecision(
+                            IdleForceRelayPolicy.onUserPresent(true),
+                            "user unlocked device"
+                    );
+                }
+            }
+        };
+        android.content.IntentFilter deviceIdleFilter = new android.content.IntentFilter(
+                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+        deviceIdleFilter.addAction(Intent.ACTION_USER_PRESENT);
+        androidx.core.content.ContextCompat.registerReceiver(
+                this,
+                deviceIdleReceiver,
+                deviceIdleFilter,
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
         );
     }
 
@@ -221,6 +278,13 @@ public class VPNService extends android.net.VpnService {
                 unregisterReceiver(stopEngineReceiver);
             } catch (IllegalArgumentException e) {
                 Log.w(LOGTAG, "Receiver not registered", e);
+            }
+        }
+        if (deviceIdleReceiver != null) {
+            try {
+                unregisterReceiver(deviceIdleReceiver);
+            } catch (IllegalArgumentException e) {
+                Log.w(LOGTAG, "Device idle receiver not registered", e);
             }
         }
 
@@ -529,6 +593,79 @@ public class VPNService extends android.net.VpnService {
         if (engineRunner != null) {
             engineRunner.stop();
         }
+    }
+
+    private void reconcileIdleForceRelayOnServiceStart() {
+        Preferences preferences = new Preferences(this);
+        if (!preferences.isForceRelayOnDeviceIdleEnabled()) {
+            return;
+        }
+
+        PowerManager powerManager = getSystemService(PowerManager.class);
+        KeyguardManager keyguardManager = getSystemService(KeyguardManager.class);
+        if (powerManager == null || keyguardManager == null) {
+            Log.w(LOGTAG, "Unable to resolve idle force-relay state on service start");
+            return;
+        }
+
+        applyIdleForceRelayDecision(
+                IdleForceRelayPolicy.onServiceStarted(
+                        true,
+                        powerManager.isDeviceIdleMode(),
+                        powerManager.isInteractive(),
+                        keyguardManager.isKeyguardLocked()),
+                "VPN service started"
+        );
+    }
+
+    private void reconcileIdleForceRelayAfterSettingChanged() {
+        Preferences preferences = new Preferences(this);
+        boolean automaticModeEnabled = preferences.isForceRelayOnDeviceIdleEnabled();
+        PowerManager powerManager = getSystemService(PowerManager.class);
+        KeyguardManager keyguardManager = getSystemService(KeyguardManager.class);
+        if (powerManager == null || keyguardManager == null) {
+            Log.w(LOGTAG, "Unable to apply idle force-relay setting");
+            if (!automaticModeEnabled) {
+                applyIdleForceRelayDecision(IdleForceRelayPolicy.Decision.DISABLE,
+                        "idle automatic mode disabled");
+            }
+            return;
+        }
+
+        applyIdleForceRelayDecision(
+                IdleForceRelayPolicy.onAutomaticModeChanged(
+                        automaticModeEnabled,
+                        powerManager.isDeviceIdleMode(),
+                        powerManager.isInteractive(),
+                        keyguardManager.isKeyguardLocked()),
+                automaticModeEnabled
+                        ? "idle automatic mode enabled"
+                        : "idle automatic mode disabled"
+        );
+    }
+
+    private void applyIdleForceRelayDecision(IdleForceRelayPolicy.Decision decision,
+                                             String reason) {
+        if (decision == IdleForceRelayPolicy.Decision.KEEP) {
+            Log.d(LOGTAG, "Keeping force-relay setting: " + reason);
+            return;
+        }
+
+        boolean enabled = decision == IdleForceRelayPolicy.Decision.ENABLE;
+        Preferences preferences = new Preferences(this);
+        boolean changed = preferences.setConnectionForceRelayed(enabled);
+        Log.i(LOGTAG, "Idle force relay " + (enabled ? "enabled" : "disabled")
+                + ": " + reason + (changed ? "" : " (preference unchanged)"));
+        reconcileRunningEngineWithStoredForceRelay();
+    }
+
+    private void reconcileRunningEngineWithStoredForceRelay() {
+        boolean enabled = new Preferences(this).isConnectionForceRelayed();
+        if (engineRunner.isForceRelaySettingApplied(enabled)) {
+            Log.d(LOGTAG, "Force-relay setting is already applied");
+            return;
+        }
+        engineRestartCoordinator.requestRestart();
     }
 
     private void restartEngineIfRequested() {
