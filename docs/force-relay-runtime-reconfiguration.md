@@ -5,7 +5,7 @@ with isolated Android control-plane DNS bootstrap during the restart.
 
 ## Problem
 
-The force-relay automation API must restart the Go engine because
+Automatic idle force-relay changes must restart the Go engine because
 `NB_FORCE_RELAY` is startup configuration. A normal engine stop closes the Go
 side of the TUN file descriptor. When that is the last open descriptor, Android
 removes the active VPN network and its routes until the next call to
@@ -25,8 +25,7 @@ See the Android documentation for
   engine restart.
 - Keep Android VPN routes continuously installed.
 - Avoid peer-level or engine-level live reconfiguration in Go.
-- Continue using the existing broadcast Intent contract and persisted
-  preference.
+- Continue using the persisted force-relay preference.
 - Coalesce repeated requests and apply the latest persisted value on the next
   run.
 - Release the retained VPN promptly on an ordinary stop or failed restart.
@@ -152,8 +151,9 @@ therefore take the same cleanup path. A failure to start the Java engine thread
 also clears the retained restart state synchronously.
 
 The existing `EngineRestartCoordinator` still prevents overlapping restarts.
-Repeated broadcasts while a restart is pending update the persisted preference
-but stop the old engine only once. The replacement run reads the latest value.
+Repeated power-state broadcasts while a restart is pending update the persisted
+preference but stop the old engine only once. The replacement run reads the
+latest value.
 
 ## Why engine restart semantics stay unchanged
 
@@ -188,7 +188,8 @@ Manual Android validation should additionally confirm:
 
 1. Connect NetBird and continuously inspect `dumpsys connectivity` and the
    system VPN indicator.
-2. Toggle force relay in both directions through ADB or Tasker.
+2. Enter device idle mode, then unlock the device to toggle force relay in both
+   directions.
 3. Confirm the VPN network ID and TUN interface remain present for the matching
    configuration path.
 4. Confirm routes remain assigned to the VPN throughout the engine restart.

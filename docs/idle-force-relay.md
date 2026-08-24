@@ -6,9 +6,7 @@ force relay:
 
 - manual force relay disables the automatic-mode row;
 - automatic mode disables the manual force-relay row;
-- disabling automatic mode restores force relay to off;
-- the public `SET_FORCE_RELAY` broadcast is ignored while automatic mode owns
-  the setting.
+- disabling automatic mode restores force relay to off.
 
 ## Power-state behavior
 

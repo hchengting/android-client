@@ -50,14 +50,6 @@
             </intent-filter>
         </activity>
 
-        <receiver
-            android:name=".ForceRelayCommandReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="io.netbird.client.intent.action.SET_FORCE_RELAY" />
-            </intent-filter>
-        </receiver>
-
         <!-- Persists the in-app language choice on API < 33 (AppCompat per-app locales). -->
         <service
             android:name="androidx.appcompat.app.AppLocalesMetadataHolderService"

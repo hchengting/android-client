@@ -34,8 +34,6 @@ public class VPNService extends android.net.VpnService {
     private final static String LOGTAG = "service";
     public static final String INTENT_ACTION_START = "io.netbird.client.intent.action.START_SERVICE";
     public static final String ACTION_STOP_ENGINE = "io.netbird.client.intent.action.STOP_ENGINE";
-    public static final String ACTION_APPLY_FORCE_RELAY_SETTING =
-            "io.netbird.client.intent.action.APPLY_FORCE_RELAY_SETTING";
     public static final String ACTION_APPLY_IDLE_FORCE_RELAY_SETTING =
             "io.netbird.client.intent.action.APPLY_IDLE_FORCE_RELAY_SETTING";
     // Launches MainActivity to run the interactive session-extend flow; set
@@ -66,7 +64,7 @@ public class VPNService extends android.net.VpnService {
     private NetworkChangeDetector networkChangeDetector;
     private ConcreteNetworkAvailabilityListener networkAvailabilityListener;
     private NetworkSwitchNotifier networkSwitchNotifier;
-    private android.content.BroadcastReceiver stopEngineReceiver;
+    private android.content.BroadcastReceiver engineCommandReceiver;
     private android.content.BroadcastReceiver deviceIdleReceiver;
 
     @Override
@@ -135,25 +133,13 @@ public class VPNService extends android.net.VpnService {
         // service starts while the device has no network (e.g. airplane mode).
         engineRunner.setNetworkAvailable(networkChangeDetector.hasInternetConnectivity());
 
-        // Register app-internal engine commands. The exported automation
-        // receiver persists the setting, then forwards only this private
-        // apply command while the VPN service is alive.
-        stopEngineReceiver = new android.content.BroadcastReceiver() {
+        // Register app-internal engine commands while the VPN service is alive.
+        engineCommandReceiver = new android.content.BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 if (ACTION_STOP_ENGINE.equals(intent.getAction())) {
                     Log.d(LOGTAG, "Received stop engine broadcast");
                     stopEngineAndCancelRestart();
-                    return;
-                }
-                if (ACTION_APPLY_FORCE_RELAY_SETTING.equals(intent.getAction())) {
-                    Log.d(LOGTAG, "Received apply force-relay setting broadcast");
-                    if (new Preferences(VPNService.this)
-                            .isForceRelayOnDeviceIdleEnabled()) {
-                        Log.d(LOGTAG, "Ignoring manual force-relay apply in idle automatic mode");
-                        return;
-                    }
-                    reconcileRunningEngineWithStoredForceRelay();
                     return;
                 }
                 if (ACTION_APPLY_IDLE_FORCE_RELAY_SETTING.equals(intent.getAction())) {
@@ -163,11 +149,10 @@ public class VPNService extends android.net.VpnService {
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_STOP_ENGINE);
-        filter.addAction(ACTION_APPLY_FORCE_RELAY_SETTING);
         filter.addAction(ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
         androidx.core.content.ContextCompat.registerReceiver(
                 this,
-                stopEngineReceiver,
+                engineCommandReceiver,
                 filter,
                 androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
         );
@@ -273,9 +258,9 @@ public class VPNService extends android.net.VpnService {
         }
 
         // Unregister broadcast receiver
-        if (stopEngineReceiver != null) {
+        if (engineCommandReceiver != null) {
             try {
-                unregisterReceiver(stopEngineReceiver);
+                unregisterReceiver(engineCommandReceiver);
             } catch (IllegalArgumentException e) {
                 Log.w(LOGTAG, "Receiver not registered", e);
             }
