@@ -38,6 +38,10 @@ The global force-relay setting can be changed by other Android apps through a
 broadcast intent. See [Force-relay automation intent](docs/force-relay-intent.md)
 for the Intent contract, Tasker setup, and ADB examples.
 
+Force relay can also be enabled automatically while Android is in device idle
+mode and kept active through Doze maintenance windows. See
+[Automatic force relay while the device is idle](docs/idle-force-relay.md).
+
 ## Screenshots
 
 <p align="center">

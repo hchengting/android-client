@@ -85,6 +85,21 @@ public class ForceRelayCommandReceiverTest {
         Assert.assertNull(context.lastBroadcast);
     }
 
+    @Test
+    public void idleAutomaticModeIgnoresForceRelayIntent() {
+        Preferences preferences = new Preferences(targetContext);
+        preferences.setConnectionForceRelayed(false);
+        preferences.setForceRelayOnDeviceIdleEnabled(true);
+        RecordingContext context = new RecordingContext(targetContext);
+        Intent intent = new Intent(ForceRelayCommandReceiver.ACTION_SET_FORCE_RELAY)
+                .putExtra(ForceRelayCommandReceiver.EXTRA_ENABLED, true);
+
+        new ForceRelayCommandReceiver().onReceive(context, intent);
+
+        Assert.assertFalse(preferences.isConnectionForceRelayed());
+        Assert.assertNull(context.lastBroadcast);
+    }
+
     private void clearPreferences() {
         targetContext.getSharedPreferences("netbird", Context.MODE_PRIVATE)
                 .edit()
