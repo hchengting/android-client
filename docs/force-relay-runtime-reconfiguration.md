@@ -50,19 +50,13 @@ rebuild them. Resolving that hostname through the retained VPN DNS path can
 therefore leave the replacement run stuck in `Connecting`.
 
 On Android, management, signal, and NetBird relay dialing now use a dedicated
-control-plane resolver. It queries these fixed public DNS servers in parallel:
-
-1. Cloudflare at `1.1.1.1:53`.
-2. Cloudflare at `[2606:4700:4700::1111]:53`.
-3. Google at `8.8.8.8:53`.
-4. Google at `[2001:4860:4860::8888]:53`.
-
-The first usable answer wins and cancels the remaining lookups. A failure,
-empty answer, or authoritative not-found response from one provider does not
-discard a successful answer from another. All four lookups share a five-second
-deadline bounded by the caller's context. The existing Android socket-protection
-hook applies to every DNS socket, so they leave through the non-VPN path even
-while the retained VPN remains active.
+control-plane resolver. The VPN service tracks Android's best internet-capable
+network with `NET_CAPABILITY_NOT_VPN`, and each lookup calls
+`Network.getAllByName()` on that specific network. It does not bind the process
+to the underlying network, replace `net.DefaultResolver`, or send queries to a
+fixed public DNS provider. If no matching network has been reported yet, the
+lookup waits for up to five seconds before failing; the Go caller can still
+return earlier when its context is cancelled.
 
 The dedicated resolver is limited to Android control-plane bootstrap paths:
 
@@ -70,6 +64,15 @@ The dedicated resolver is limited to Android control-plane bootstrap paths:
 - the management DNS cache when it resolves management, signal, or relay
   domains;
 - route-manager bootstrap resolution for management, signal, and relay URLs.
+
+The management cache requests both address families in one underlying-network
+lookup and splits the result into A and AAAA records in Go.
+
+Ordinary DNS queries keep using the existing DNS handler chain. In particular,
+an assigned peer DNS server that is not one of Android's original DNS servers
+is still queried through the VPN, so control-plane bootstrap does not leak
+peer-DNS traffic to the underlying network. Android original-DNS fallback
+and Private DNS behavior are unchanged.
 
 Route bootstrap resolves each unique hostname only once. After lookup, TCP is
 dialed using the resolved IP; QUIC receives a resolved UDP address. The original
@@ -175,8 +178,13 @@ Automated coverage verifies:
 - the old engine stop keeps the descriptor only for a requested restart;
 - a replacement run can reuse it once;
 - cancellation and pre-attach failure do not retain the VPN.
-- public DNS providers are queried concurrently under one timeout;
-- a successful provider wins even if the other returns not-found;
+- the Android callback result is filtered by address family and duplicate
+  addresses are removed;
+- control-plane lookup cancellation does not wait for Android's blocking DNS
+  call to finish;
+- a wrong-family answer maps to DNS NODATA for the management cache;
+- management bootstrap obtains A and AAAA records with one control-plane
+  resolver call per domain;
 - control-plane dialing resolves hostnames before dialing while literal IPs
   bypass DNS;
 - QUIC receives the UDP endpoint resolved by the control-plane resolver.

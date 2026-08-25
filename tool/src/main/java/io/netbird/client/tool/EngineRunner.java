@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import io.netbird.gomobile.android.Android;
 import io.netbird.gomobile.android.Client;
 import io.netbird.gomobile.android.ConnectionListener;
+import io.netbird.gomobile.android.ControlPlaneResolver;
 import io.netbird.gomobile.android.DNSList;
 import io.netbird.gomobile.android.ErrListener;
 import io.netbird.gomobile.android.NetworkArray;
@@ -42,7 +43,7 @@ class EngineRunner {
 
     public EngineRunner(Context context, NetworkChangeListener networkChangeListener, IFace tunAdapter,
                         IFaceDiscover iFaceDiscover, String versionName, boolean isTraceLogEnabled, boolean isDebuggable,
-                        ProfileManagerWrapper profileManager) {
+                        ProfileManagerWrapper profileManager, ControlPlaneResolver controlPlaneResolver) {
         this.context = context;
         this.isDebuggable = isDebuggable;
         this.profileManager = profileManager;
@@ -54,7 +55,8 @@ class EngineRunner {
                 versionName,
                 tunAdapter,
                 iFaceDiscover,
-                networkChangeListener);
+                networkChangeListener,
+                controlPlaneResolver);
 
         updateLogLevel(isTraceLogEnabled, isDebuggable);
 
