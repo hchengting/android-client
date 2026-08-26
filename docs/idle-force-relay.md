@@ -30,16 +30,24 @@ while no receiver was registered:
 - locked or non-interactive non-idle state preserves the last effective value,
   because it may represent a maintenance window.
 
-## Engine restart and VPN continuity
+## Runtime application and VPN continuity
 
-Every effective change uses the existing force-relay reconciliation path. A
-running engine is stopped through `EngineRunner.stopPreservingTun()` and started
-again after the stop callback. The Android VPN service, foreground lifecycle,
-TUN descriptor, and routes remain active during the normal matching-TUN path.
+Every effective change uses the runtime force-relay reconciliation path. Android
+persists the effective value, then asks the running Go client to update its
+engine-owned transport policy. The engine, Android VPN service, foreground
+lifecycle, TUN descriptor, routes, DNS, firewall, and control-plane sessions stay
+active.
 
-Repeated broadcasts and already-applied values do not trigger another restart.
-If the engine is stopped, NetBird records the effective setting without starting
-the VPN; the next engine run reads the reconciled value.
+Only peer transports that are currently open are recycled. Enabling force relay
+reopens them with relay only; disabling it creates fresh ICE workers alongside
+relay. Closed lazy peers remain closed and use the new policy on their next
+activation.
+
+Requests are serialized on a background executor and rapid changes are
+coalesced to the latest value. If the engine is stopped or still initializing,
+NetBird records the desired setting without starting the VPN; the next engine
+run consumes it. The `NB_FORCE_RELAY` environment value remains a startup
+fallback rather than the runtime source of truth.
 
 See [Runtime force-relay reconfiguration](force-relay-runtime-reconfiguration.md)
-for the retained TUN lifecycle and failure behavior.
+for lifecycle, concurrency, and failure behavior.
