@@ -130,8 +130,8 @@ failed call can therefore be retried by the next reconciliation event.
 ## Legacy cleanup boundary
 
 The force-relay reconciliation path no longer calls `stopPreservingTun()` or
-the engine restart coordinator. No other production path consumes the retained
-descriptor, so the coordinator and retained-TUN restart mechanism can be
+the engine restart coordinator. No other production path consumed the retained
+descriptor, so the coordinator and retained-TUN restart mechanism have been
 removed as legacy code.
 
 The Android underlying-network control-plane resolver must remain. It has an
