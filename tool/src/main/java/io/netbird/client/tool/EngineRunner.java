@@ -23,6 +23,7 @@ import io.netbird.gomobile.android.NetworkChangeListener;
 import io.netbird.gomobile.android.PeerInfoArray;
 import io.netbird.gomobile.android.SSHClient;
 import io.netbird.gomobile.android.StateChangeListener;
+import io.netbird.gomobile.android.TunAdapter;
 import io.netbird.gomobile.android.TunSettings;
 import io.netbird.gomobile.android.URLOpener;
 
@@ -43,16 +44,12 @@ class EngineRunner {
     private final ExecutorService forceRelayExecutor;
     private final ForceRelayReconfigurationCoordinator forceRelayReconfigurationCoordinator;
 
-    private final IFace tunAdapter;
-
-    public EngineRunner(Context context, NetworkChangeListener networkChangeListener, IFace tunAdapter,
+    public EngineRunner(Context context, NetworkChangeListener networkChangeListener, TunAdapter tunAdapter,
                         IFaceDiscover iFaceDiscover, String versionName, boolean isTraceLogEnabled, boolean isDebuggable,
                         ProfileManagerWrapper profileManager, ControlPlaneResolver controlPlaneResolver) {
         this.context = context;
         this.isDebuggable = isDebuggable;
         this.profileManager = profileManager;
-        this.tunAdapter = tunAdapter;
-
         goClient = Android.newClient(
                 androidSDKVersion(),
                 DeviceName.getDeviceName(),
@@ -167,7 +164,6 @@ class EngineRunner {
 
         engineIsRunning = true;
         activeForceRelaySetting = forceRelaySetting;
-        tunAdapter.onEngineRunStarted();
         Runnable r = () -> {
             DNSWatch dnsWatch = new DNSWatch(context);
             try {
@@ -199,7 +195,6 @@ class EngineRunner {
                 Log.e(LOGTAG, "goClient error", e);
                 notifyError(e);
             } finally {
-                tunAdapter.onEngineStopped();
                 synchronized (EngineRunner.this) {
                     engineIsRunning = false;
                     activeForceRelaySetting = null;
@@ -213,7 +208,6 @@ class EngineRunner {
         try {
             new Thread(r).start();
         } catch (RuntimeException e) {
-            tunAdapter.onEngineStopped();
             engineIsRunning = false;
             activeForceRelaySetting = null;
             throw e;
@@ -397,17 +391,7 @@ class EngineRunner {
     }
 
     public synchronized void stop() {
-        tunAdapter.cancelPreservedEngineRestart();
         goClient.stop();
-    }
-
-    public synchronized void stopPreservingTun() {
-        tunAdapter.preserveForEngineRestart();
-        goClient.stop();
-    }
-
-    public synchronized void cancelPreservedTunRestart() {
-        tunAdapter.cancelPreservedEngineRestart();
     }
 
     public PeerInfoArray peersInfo() {
