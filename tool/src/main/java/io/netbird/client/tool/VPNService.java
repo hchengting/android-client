@@ -35,6 +35,8 @@ public class VPNService extends android.net.VpnService {
     private final static String LOGTAG = "service";
     public static final String INTENT_ACTION_START = "io.netbird.client.intent.action.START_SERVICE";
     public static final String ACTION_STOP_ENGINE = "io.netbird.client.intent.action.STOP_ENGINE";
+    public static final String ACTION_APPLY_FORCE_RELAY_SETTING =
+            "io.netbird.client.intent.action.APPLY_FORCE_RELAY_SETTING";
     public static final String ACTION_APPLY_IDLE_FORCE_RELAY_SETTING =
             "io.netbird.client.intent.action.APPLY_IDLE_FORCE_RELAY_SETTING";
     // Launches MainActivity to run the interactive session-extend flow; set
@@ -50,9 +52,7 @@ public class VPNService extends android.net.VpnService {
     private static final String STATUS_LOGIN_FAILED = "LoginFailed";
     private final IBinder myBinder = new MyLocalBinder();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Runnable restartEngineRunnable = this::restartEngineIfRequested;
     private EngineRunner engineRunner;
-    private EngineRestartCoordinator engineRestartCoordinator;
     private IFace iface;
     private ForegroundNotification fgNotification;
     private SessionNotification sessionNotification;
@@ -101,10 +101,6 @@ public class VPNService extends android.net.VpnService {
         engineRunner = new EngineRunner(this, notifier, iface, iFaceDiscover, versionName,
                 preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager,
                 underlyingNetworkResolver);
-        engineRestartCoordinator = new EngineRestartCoordinator(
-                engineRunner::isRunning,
-                engineRunner::stopPreservingTun
-        );
         reconcileIdleForceRelayOnServiceStart();
 
         // Session tracking lives here, in the service — the Android analogue
@@ -148,7 +144,12 @@ public class VPNService extends android.net.VpnService {
             public void onReceive(Context context, Intent intent) {
                 if (ACTION_STOP_ENGINE.equals(intent.getAction())) {
                     Log.d(LOGTAG, "Received stop engine broadcast");
-                    stopEngineAndCancelRestart();
+                    stopEngine();
+                    return;
+                }
+                if (ACTION_APPLY_FORCE_RELAY_SETTING.equals(intent.getAction())) {
+                    Log.d(LOGTAG, "Received apply force-relay setting broadcast");
+                    reconcileRunningEngineWithStoredForceRelay();
                     return;
                 }
                 if (ACTION_APPLY_IDLE_FORCE_RELAY_SETTING.equals(intent.getAction())) {
@@ -158,6 +159,7 @@ public class VPNService extends android.net.VpnService {
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_STOP_ENGINE);
+        filter.addAction(ACTION_APPLY_FORCE_RELAY_SETTING);
         filter.addAction(ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
         androidx.core.content.ContextCompat.registerReceiver(
                 this,
@@ -250,7 +252,7 @@ public class VPNService extends android.net.VpnService {
     @Override
     public boolean onUnbind(Intent intent) {
         Log.d(LOGTAG, "unbind from activity");
-        if (!engineRunner.isRunning() && !engineRestartCoordinator.isRestartPending()) {
+        if (!engineRunner.isRunning()) {
             stopSelf();
         }
         return false; // false means do not call onRebind
@@ -260,11 +262,6 @@ public class VPNService extends android.net.VpnService {
     public void onDestroy() {
         super.onDestroy();
         Log.d(LOGTAG, "onDestroy");
-
-        mainHandler.removeCallbacks(restartEngineRunnable);
-        if (engineRestartCoordinator != null) {
-            engineRestartCoordinator.cancelRestart();
-        }
 
         // Unregister broadcast receiver
         if (engineCommandReceiver != null) {
@@ -286,6 +283,7 @@ public class VPNService extends android.net.VpnService {
         networkChangeDetector.unsubscribe();
         networkChangeDetector.unregisterNetworkCallback();
 
+        engineRunner.shutdown();
         engineRunner.stop();
         underlyingNetworkResolver.unregister();
         stopForeground(true);
@@ -304,7 +302,7 @@ public class VPNService extends android.net.VpnService {
     public void onRevoke() {
         Log.d(LOGTAG, "VPN permission on revoke");
         if (engineRunner != null) {
-            stopEngineAndCancelRestart();
+            stopEngine();
             stopForeground(true);
         }
     }
@@ -328,8 +326,6 @@ public class VPNService extends android.net.VpnService {
         }
 
         public void runEngine(URLOpener urlOpener, boolean isAndroidTV) {
-            engineRestartCoordinator.cancelRestart();
-            mainHandler.removeCallbacks(restartEngineRunnable);
             fgNotification.setState(ForegroundNotification.State.CONNECTING);
             fgNotification.startForeground();
             sessionNotification.cancel();
@@ -337,7 +333,7 @@ public class VPNService extends android.net.VpnService {
         }
 
         public void stopEngine() {
-            stopEngineAndCancelRestart();
+            VPNService.this.stopEngine();
         }
 
         public boolean isRunning() {
@@ -545,23 +541,13 @@ public class VPNService extends android.net.VpnService {
 
         @Override
         public void onStopped() {
-            boolean restartPending = engineRestartCoordinator.isRestartPending();
-            if (restartPending) {
-                // The service and retained TUN stay alive across this internal
-                // restart, so keep the foreground lifecycle continuous too.
-                fgNotification.setState(ForegroundNotification.State.CONNECTING);
-            } else {
-                // The Go side latches NeedsLogin until a login or session
-                // extension clears it, so preserve that actionable state.
-                fgNotification.setState(sessionMonitor.isLoginRequired()
-                        ? ForegroundNotification.State.NEEDS_LOGIN
-                        : ForegroundNotification.State.DISCONNECTED);
-                fgNotification.stopForeground();
-            }
+            // The Go side latches NeedsLogin until a login or session
+            // extension clears it, so preserve that actionable state.
+            fgNotification.setState(sessionMonitor.isLoginRequired()
+                    ? ForegroundNotification.State.NEEDS_LOGIN
+                    : ForegroundNotification.State.DISCONNECTED);
+            fgNotification.stopForeground();
             sessionMonitor.onStateChanged();
-            if (restartPending) {
-                mainHandler.post(restartEngineRunnable);
-            }
         }
 
         @Override
@@ -580,11 +566,7 @@ public class VPNService extends android.net.VpnService {
         }
     };
 
-    private void stopEngineAndCancelRestart() {
-        if (engineRestartCoordinator != null) {
-            engineRestartCoordinator.cancelRestart();
-        }
-        mainHandler.removeCallbacks(restartEngineRunnable);
+    private void stopEngine() {
         if (engineRunner != null) {
             engineRunner.stop();
         }
@@ -660,32 +642,7 @@ public class VPNService extends android.net.VpnService {
             Log.d(LOGTAG, "Force-relay setting is already applied");
             return;
         }
-        engineRestartCoordinator.requestRestart();
-    }
-
-    private void restartEngineIfRequested() {
-        if (!engineRestartCoordinator.consumeRestart()) {
-            return;
-        }
-        if (engineRunner.isRunning()) {
-            // A manual or always-on start won the race. That new run already
-            // reads the latest preference, so another restart is unnecessary.
-            return;
-        }
-        if (sessionMonitor.isLoginRequired()) {
-            Log.i(LOGTAG, "Force-relay setting saved; reconnect requires login");
-            engineRunner.cancelPreservedTunRestart();
-            fgNotification.setState(ForegroundNotification.State.NEEDS_LOGIN);
-            fgNotification.stopForeground();
-            stopSelf();
-            return;
-        }
-
-        Log.i(LOGTAG, "Restarting engine to apply force-relay setting");
-        fgNotification.setState(ForegroundNotification.State.CONNECTING);
-        fgNotification.startForeground();
-        sessionNotification.cancel();
-        engineRunner.runWithoutAuth();
+        engineRunner.setForceRelay(enabled);
     }
 
     private TUNCreatorLooperThread tunCreator;

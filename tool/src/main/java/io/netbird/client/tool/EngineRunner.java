@@ -9,6 +9,8 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.netbird.gomobile.android.Android;
 import io.netbird.gomobile.android.Client;
@@ -38,6 +40,8 @@ class EngineRunner {
     private volatile SessionMonitor sessionMonitor;
     private final Client goClient;
     private ConnectionListener connectionListener;
+    private final ExecutorService forceRelayExecutor;
+    private final ForceRelayReconfigurationCoordinator forceRelayReconfigurationCoordinator;
 
     private final IFace tunAdapter;
 
@@ -57,6 +61,16 @@ class EngineRunner {
                 iFaceDiscover,
                 networkChangeListener,
                 controlPlaneResolver);
+
+        forceRelayExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "NetBird-force-relay");
+            thread.setDaemon(true);
+            return thread;
+        });
+        forceRelayReconfigurationCoordinator = new ForceRelayReconfigurationCoordinator(
+                forceRelayExecutor,
+                this::applyForceRelaySetting
+        );
 
         updateLogLevel(isTraceLogEnabled, isDebuggable);
 
@@ -218,6 +232,30 @@ class EngineRunner {
         return engineIsRunning
                 && activeForceRelaySetting != null
                 && activeForceRelaySetting == enabled;
+    }
+
+    public void setForceRelay(boolean enabled) {
+        forceRelayReconfigurationCoordinator.request(enabled);
+    }
+
+    private void applyForceRelaySetting(boolean enabled) {
+        try {
+            goClient.setForceRelay(enabled);
+            synchronized (this) {
+                if (engineIsRunning) {
+                    activeForceRelaySetting = enabled;
+                }
+            }
+            Log.i(LOGTAG, "Applied runtime force-relay setting: " + enabled);
+        } catch (Exception e) {
+            Log.e(LOGTAG, "Failed to apply runtime force-relay setting", e);
+            notifyError(e);
+        }
+    }
+
+    public void shutdown() {
+        forceRelayReconfigurationCoordinator.close();
+        forceRelayExecutor.shutdownNow();
     }
 
     public synchronized void setConnectionListener(ConnectionListener listener) {

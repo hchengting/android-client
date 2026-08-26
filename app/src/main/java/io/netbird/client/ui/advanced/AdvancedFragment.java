@@ -8,11 +8,9 @@ import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
-import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatDelegate;
 import androidx.fragment.app.Fragment;
 
@@ -31,17 +29,6 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
     private FragmentAdvancedBinding binding;
     private io.netbird.gomobile.android.Preferences goPreferences;
     private boolean updatingForceRelayControls;
-
-    private void showReconnectionNeededWarningDialog() {
-        final View dialogView = getLayoutInflater().inflate(R.layout.dialog_simple_alert_message, null);
-        final AlertDialog alertDialog = new AlertDialog.Builder(requireContext(), R.style.AlertDialogTheme)
-                .setView(dialogView)
-                .create();
-
-        ((TextView)dialogView.findViewById(R.id.txt_dialog)).setText(R.string.reconnectionNeededWarningMessage);
-        dialogView.findViewById(R.id.btn_ok_dialog).setOnClickListener(v -> alertDialog.dismiss());
-        alertDialog.show();
-    }
 
     private void configureForceRelayConnectionSwitches(@NonNull Preferences preferences) {
         boolean automaticModeEnabled = preferences.isForceRelayOnDeviceIdleEnabled();
@@ -65,7 +52,7 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
             }
 
             updateForceRelayControlAvailability(preferences);
-            showReconnectionNeededWarningDialog();
+            requestForceRelayReconciliation();
         });
 
         binding.layoutForceRelayConnection.setOnClickListener(v -> binding.switchForceRelayConnection.toggle());
@@ -128,8 +115,16 @@ public class AdvancedFragment extends Fragment implements ThemePickerSheet.OnThe
     }
 
     private void requestIdleForceRelayReconciliation() {
+        sendForceRelayReconciliation(VPNService.ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
+    }
+
+    private void requestForceRelayReconciliation() {
+        sendForceRelayReconciliation(VPNService.ACTION_APPLY_FORCE_RELAY_SETTING);
+    }
+
+    private void sendForceRelayReconciliation(String action) {
         Context context = requireContext();
-        Intent intent = new Intent(VPNService.ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
+        Intent intent = new Intent(action);
         intent.setPackage(context.getPackageName());
         context.sendBroadcast(intent);
     }

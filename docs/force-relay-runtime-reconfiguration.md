@@ -1,214 +1,181 @@
-# Force-relay reconfiguration without a VPN route gap
+# Runtime force-relay reconfiguration without an engine restart
 
-Status: implemented by retaining and reusing the Android TUN file descriptor,
-with isolated Android control-plane DNS bootstrap during the restart.
+Status: phase 1 implemented. Force-relay changes keep the Go engine and Android
+VPN alive and recycle only open peer transports.
 
 ## Problem
 
-Automatic idle force-relay changes must restart the Go engine because
-`NB_FORCE_RELAY` is startup configuration. A normal engine stop closes the Go
-side of the TUN file descriptor. When that is the last open descriptor, Android
-removes the active VPN network and its routes until the next call to
-`VpnService.Builder.establish()` succeeds.
+Force relay was originally read from `NB_FORCE_RELAY` while the engine started.
+Changing it at runtime therefore required stopping and starting the entire
+engine. Even when Android retained the TUN descriptor and its routes, that
+restart disconnected management, signal, relay, DNS, and every peer at once.
 
-Changing force-relay mode does not require Android to remove the VPN network.
-It is acceptable for management, signal, relay, and peer connections to
-disconnect while the Go engine restarts, but the Android VPN interface and its
-route ownership must remain active.
-
-See the Android documentation for
-[`VpnService.Builder.establish()`](https://developer.android.com/reference/android/net/VpnService.Builder#establish()).
+Force relay is a peer transport policy. It determines whether a peer run creates
+only its relay worker or creates both relay and ICE workers. It does not require
+rebuilding the overlay interface, route manager, firewall, DNS manager, or
+control-plane clients.
 
 ## Goals
 
-- Keep the existing Android VPN interface and TUN alive across a force-relay
-  engine restart.
-- Keep Android VPN routes continuously installed.
-- Avoid peer-level or engine-level live reconfiguration in Go.
-- Continue using the persisted force-relay preference.
-- Coalesce repeated requests and apply the latest persisted value on the next
-  run.
-- Release the retained VPN promptly on an ordinary stop or failed restart.
+- Keep the engine, Android VPN interface, TUN, routes, DNS, firewall, and
+  control-plane sessions running.
+- Make the engine-owned force-relay value the runtime source of truth.
+- Recycle only peer transports that are currently open.
+- Keep closed lazy peers closed and apply the latest value when they activate.
+- Coalesce rapid Android requests and perform Go calls off the main thread.
+- Preserve the environment variable as startup compatibility input.
+- Recover a peer's previous transport policy if applying a new policy fails.
 
-## Accepted interruptions
+## Accepted interruption
 
-- The Go engine still stops and starts.
-- Management, signal, and relay sessions reconnect.
-- Peer traffic is unavailable until the new engine has rebuilt peer
-  connections.
-- In-flight packets may be lost while no Go engine is reading from the TUN.
+An open peer is briefly unavailable while its relay, ICE, handshaker, guard, and
+endpoint state are closed and recreated. In-flight packets for that peer may be
+lost. Other peers and engine-owned subsystems remain running.
 
-The Android routes remain active during this interval. Packets can be delayed or
-dropped, but they do not escape through a temporarily restored non-VPN route.
-
-## Control-plane DNS bootstrap
-
-Keeping the VPN network alive also keeps its DNS routing active. During the
-engine restart, the old peer DNS service and peer connections are already down,
-but the replacement engine must resolve the management server before it can
-rebuild them. Resolving that hostname through the retained VPN DNS path can
-therefore leave the replacement run stuck in `Connecting`.
-
-On Android, management, signal, and NetBird relay dialing now use a dedicated
-control-plane resolver. The VPN service tracks Android's best internet-capable
-network with `NET_CAPABILITY_NOT_VPN`, and each lookup calls
-`Network.getAllByName()` on that specific network. It does not bind the process
-to the underlying network, replace `net.DefaultResolver`, or send queries to a
-fixed public DNS provider. If no matching network has been reported yet, the
-lookup waits for up to five seconds before failing; the Go caller can still
-return earlier when its context is cancelled.
-
-The dedicated resolver is limited to Android control-plane bootstrap paths:
-
-- management and signal gRPC plus NetBird relay WebSocket and QUIC dialing;
-- the management DNS cache when it resolves management, signal, or relay
-  domains;
-- route-manager bootstrap resolution for management, signal, and relay URLs.
-
-The management cache requests both address families in one underlying-network
-lookup and splits the result into A and AAAA records in Go.
-
-Ordinary DNS queries keep using the existing DNS handler chain. In particular,
-an assigned peer DNS server that is not one of Android's original DNS servers
-is still queried through the VPN, so control-plane bootstrap does not leak
-peer-DNS traffic to the underlying network. Android original-DNS fallback
-and Private DNS behavior are unchanged.
-
-Route bootstrap resolves each unique hostname only once. After lookup, TCP is
-dialed using the resolved IP; QUIC receives a resolved UDP address. The original
-hostname remains in the gRPC target, WebSocket URL, and TLS server name, so
-certificate validation and SNI are unchanged. Literal IP endpoints bypass DNS.
-
-This does not replace `net.DefaultResolver`, change Android's global DNS, alter
-the DNS servers installed on the NetBird VPN, or change peer DNS handling.
-Other DNS traffic continues to use the existing peer/VPN DNS path. Non-Android
-platforms retain their existing resolver behavior. STUN/TURN, flow, and metrics
-dial paths are outside this change.
+There is no engine-wide reconnect, Android VPN network replacement, route gap,
+or control-plane DNS bootstrap caused by a force-relay change.
 
 ## Design
 
 ```text
-VpnService.Builder.establish()
+Advanced UI / idle power event
               |
               v
-      ParcelFileDescriptor
-          /           \
-         / dup()       \ detachFd()
-        v               v
-Java retained fd     Go engine fd
-        |               |
-        |          Engine.Stop() closes it
-        |               X
-        |
-        +--- dup() ---> new Go engine fd
-
-Android VPN interface and routes stay alive while the retained fd is open.
+      persisted preference
+              |
+              v
+ VPNService reconciliation
+              |
+              v
+ background latest-value coordinator
+              |
+              v
+ gomobile Client.SetForceRelay()
+              |
+              v
+ ConnectClient desired value
+              |
+              v
+ Engine.SetForceRelay()  -- serialized by syncMsgMux
+        |                                  |
+        v                                  v
+ toggle SRWatcher ICE monitor       peer connection store
+                                           |
+                     +---------------------+--------------------+
+                     |                                          |
+              open peer: recycle                         closed lazy peer:
+              connection transports                     record policy only
 ```
 
-`IFace` is shared by all runs of one `VPNService`. After `establish()` succeeds,
-it duplicates the descriptor before detaching the original descriptor for Go.
-The duplicate is an ownership guard, not a second TUN interface.
+`Engine` stores the active policy atomically. New peer connections receive a
+snapshot of that value. Existing connections also own an atomic desired value,
+so no runtime path mutates process environment or a shared connection config.
 
-When force-relay changes, `EngineRunner.stopPreservingTun()` marks the next stop
-as an internal restart and then calls the existing Go `Client.Stop()`. Go closes
-its descriptor while the retained Java descriptor keeps the same Android VPN
-network alive.
+For an open peer, `Conn.ReconfigureForceRelay()` serializes against `Open()` and
+`Close()`, closes the current connection run, then creates a new run:
 
-The next engine run calls `TunAdapter.ConfigureInterface()` as usual. If its
-address, MTU, DNS, search domains, and routes match the retained TUN,
-`IFace` duplicates the retained descriptor and returns it without calling
-`Builder.establish()` again. Force-relay alone does not change those settings,
-so this is the expected path.
+- force relay on: relay worker only, with no ICE credentials in signaling;
+- force relay off: relay and a fresh ICE worker, with fresh ICE credentials.
 
-If the TUN settings changed while the engine was restarting, a new interface is
-established before the retained descriptor is released. The engine therefore
-receives the updated settings instead of silently using stale routes.
+The peer object, status recorder, configured allowed IPs, and engine membership
+remain intact. The previous run's worker pointers are cleared only after its
+goroutines stop, so a stale ICE worker cannot leak into relay-only mode.
 
-## Lifecycle state
+`SRWatcher` keeps its signal and relay reconnect callbacks registered for the
+engine lifetime. Its ICE candidate monitor is stopped when force relay is on and
+started again when force relay is off.
 
-The retained descriptor follows a small state machine:
+## Startup and request ordering
 
-| Event | Action |
-|---|---|
-| Initial TUN established | Duplicate and retain its descriptor. |
-| Ordinary engine stop | Release the retained descriptor; Go closes its descriptor during shutdown. |
-| Force-relay restart requested | Keep the retained descriptor after the old run stops. |
-| Replacement run starts | Allow matching `ConfigureInterface()` to reuse the retained TUN. |
-| Replacement TUN attached | Return to normal ownership. |
-| Replacement run fails before attach | Release the retained descriptor. |
-| Restart cancelled, VPN revoked, or service destroyed | Release the retained descriptor. |
-| Interactive login required | Save the preference, release the VPN, and wait for a normal user connection. |
+Android writes the preference first, then submits runtime application to a
+single background executor. The coordinator retains one pending Boolean, so a
+burst such as on/off/on applies the latest pending value instead of scheduling
+three independent reconfigurations. A change arriving during an application is
+handled by one additional pass.
 
-The foreground service also remains active during the internal restart. An
-ordinary stop still removes its foreground notification.
+The gomobile client records a desired value even when login or engine creation
+is still in progress. A generation counter prevents an older environment
+snapshot captured by the Java run thread from overwriting a newer runtime call.
+When no runtime call has occurred, `NB_FORCE_RELAY` seeds the initial value for
+backward compatibility.
 
-## Concurrency and cleanup
+If the client is stopped, setting force relay updates only the desired value.
+It does not start the engine or VPN. A later engine instance is created with the
+latest desired value.
 
-All retained-descriptor and restart-state operations are serialized by the
-shared `IFace` instance. The active TUN configuration is immutable, so matching
-does not race with route-renewal callbacks.
+## Concurrency and failure handling
 
-`EngineRunner` calls the TUN stop hook from its run-loop `finally` block. Profile
-lookup failures, Go client errors, failed TUN attachment, and normal shutdown
-therefore take the same cleanup path. A failure to start the Java engine thread
-also clears the retained restart state synchronously.
+`Engine.SetForceRelay()` takes `syncMsgMux`, the same serialization boundary used
+for engine lifecycle and network-map changes. This prevents peer creation or
+removal from interleaving with the store-wide policy update.
 
-The existing `EngineRestartCoordinator` still prevents overlapping restarts.
-Repeated power-state broadcasts while a restart is pending update the persisted
-preference but stop the old engine only once. The replacement run reads the
-latest value.
+Each peer has a separate lifecycle mutex around open, close, and transport
+reconfiguration. Run-owned objects are constructed in local variables and are
+published to the connection only after every fallible construction step
+succeeds. Goroutines receive those run-owned objects as parameters instead of
+reading fields that a later run can replace. ICE and relay callbacks carry the
+originating worker identity, so a delayed callback from an old run cannot mutate
+the replacement run.
 
-## Why engine restart semantics stay unchanged
+If opening the new policy fails, the connection restores its previous policy
+and attempts to reopen it. The engine keeps the new desired value and returns an
+aggregated error for peers that could not apply it. Repeating the same engine
+setting reconciles peers again, while peers already on that value remain
+untouched. If both the new run and rollback fail, the peer remains closed and
+the combined error is reported.
 
-The engine still owns and closes its descriptor normally. Android retains a
-different descriptor created with `dup()`, so Go does not need a special close
-mode or a process-global TUN object. The Go networking change is limited to the
-Android control-plane dialer described above.
+Android updates its applied-value snapshot only after the Go call succeeds. A
+failed call can therefore be retried by the next reconciliation event.
 
-This keeps force-relay startup semantics consistent: each replacement engine
-reads one `NB_FORCE_RELAY` value before it starts. It avoids changing peer
-workers, `SRWatcher`, management sync locking, or status evaluation.
+## Legacy cleanup boundary
+
+The force-relay reconciliation path no longer calls `stopPreservingTun()` or
+the engine restart coordinator. No other production path consumes the retained
+descriptor, so the coordinator and retained-TUN restart mechanism can be
+removed as legacy code.
+
+The Android underlying-network control-plane resolver must remain. It has an
+independent role during ordinary Wi-Fi/mobile handover and is not part of the
+force-relay restart mechanism. See
+[Force-relay runtime migration: legacy cleanup](force-relay-legacy-cleanup.md)
+for the exact removal set, dependency order, and verification gates.
 
 ## Verification
 
 Automated coverage verifies:
 
-- identical TUN configurations are reusable;
-- changes to addresses, DNS, or routes are not treated as the same TUN;
-- the old engine stop keeps the descriptor only for a requested restart;
-- a replacement run can reuse it once;
-- cancellation and pre-attach failure do not retain the VPN.
-- the Android callback result is filtered by address family and duplicate
-  addresses are removed;
-- control-plane lookup cancellation does not wait for Android's blocking DNS
-  call to finish;
-- a wrong-family answer maps to DNS NODATA for the management cache;
-- management bootstrap obtains A and AAAA records with one control-plane
-  resolver call per domain;
-- control-plane dialing resolves hostnames before dialing while literal IPs
-  bypass DNS;
-- QUIC receives the UDP endpoint resolved by the control-plane resolver.
-- management-cache bootstrap bypasses the peer DNS chain only for management,
-  signal, and relay domains;
-- route bootstrap resolves a repeated control-plane hostname once.
+- an open relay-only peer is rebuilt with a fresh ICE worker when force relay is
+  disabled;
+- enabling force relay removes the previous run's ICE worker and ICE signaling
+  credentials;
+- a closed lazy peer remains closed and uses the new value on activation;
+- engine updates reach stored peers without starting closed peers;
+- a stopped or not-yet-started connect client queues the desired value;
+- the ICE monitor can be disabled and restarted without removing signal or
+  relay reconnect callbacks;
+- rapid Android requests coalesce to the latest value, including a request that
+  arrives while another value is being applied;
+- touched Go packages pass focused race-detector tests;
+- the regenerated Android binding and app Java source compile together.
 
 Manual Android validation should additionally confirm:
 
-1. Connect NetBird and continuously inspect `dumpsys connectivity` and the
-   system VPN indicator.
-2. Enter device idle mode, then unlock the device to toggle force relay in both
-   directions.
-3. Confirm the VPN network ID and TUN interface remain present for the matching
-   configuration path.
-4. Confirm routes remain assigned to the VPN throughout the engine restart.
-5. Confirm management and peers reconnect with the requested relay mode.
-6. Stop NetBird normally and confirm the VPN interface is removed.
-7. Repeat with always-on VPN and **Block connections without VPN** enabled.
+1. Connect NetBird and note the engine connection plus Android VPN network ID.
+2. Toggle manual force relay on and off while continuously sending traffic to
+   multiple peers.
+3. Enter device idle mode, then unlock the device to exercise both automatic
+   transitions.
+4. Confirm the Android VPN network ID, TUN interface, routes, foreground service,
+   and management/signal sessions remain present.
+5. Confirm only peer connections reconnect and their resulting transport mode
+   matches the requested value.
+6. Repeat rapid on/off/on changes and confirm the final mode wins.
+7. Repeat with an idle lazy peer and confirm the setting does not activate it.
+8. Stop NetBird normally and confirm the VPN interface is removed.
 
 ## Future optimization
 
-A future version can avoid the Go engine restart by making force-relay
-engine-scoped, dynamically updating the signal/relay watcher, and rebuilding
-only peer transports. That can reduce peer packet loss, but it is not required
-to preserve the Android VPN interface or its routes and would be a much larger
-Go concurrency change.
+Phase 2 can investigate changing a live peer between ICE and relay without
+closing the whole peer connection run. That could reduce the remaining
+per-peer packet loss, but it requires a more granular handshaker and worker
+lifecycle than phase 1.
