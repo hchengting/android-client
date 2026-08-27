@@ -119,9 +119,10 @@ active responsibility:
 - `EnvVarPackager.getEnvironmentVariables(forceRelaySetting)` and
   `NB_FORCE_RELAY`. A cold engine still needs an initial value; the runtime
   setter becomes authoritative only after it is called.
-- `EngineRunner.activeForceRelaySetting` and
-  `isForceRelaySettingApplied()`. Android uses them to suppress duplicate
-  runtime requests and updates the snapshot only after a successful Go call.
+- `EngineRunner.requestedForceRelaySetting` and
+  `isForceRelaySettingRequested()`. Android uses them to suppress duplicate
+  runtime requests and updates the snapshot only after a successful Go call;
+  actual application can remain pending on an individual peer.
 - `ACTION_APPLY_FORCE_RELAY_SETTING` and
   `ACTION_APPLY_IDLE_FORCE_RELAY_SETTING`. They are app-internal triggers for
   manual and idle reconciliation, not restart commands.
