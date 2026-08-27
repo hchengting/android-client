@@ -638,8 +638,8 @@ public class VPNService extends android.net.VpnService {
 
     private void reconcileRunningEngineWithStoredForceRelay() {
         boolean enabled = new Preferences(this).isConnectionForceRelayed();
-        if (engineRunner.isForceRelaySettingApplied(enabled)) {
-            Log.d(LOGTAG, "Force-relay setting is already applied");
+        if (engineRunner.isForceRelaySettingRequested(enabled)) {
+            Log.d(LOGTAG, "Force-relay setting is already requested");
             return;
         }
         engineRunner.setForceRelay(enabled);

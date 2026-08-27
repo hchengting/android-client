@@ -34,7 +34,7 @@ class EngineRunner {
     private final boolean isDebuggable;
     private final ProfileManagerWrapper profileManager;
     private boolean engineIsRunning = false;
-    private Boolean activeForceRelaySetting;
+    private Boolean requestedForceRelaySetting;
     Set<ServiceStateListener> serviceStateListeners = ConcurrentHashMap.newKeySet();
     private final Set<Runnable> connectedObservers = ConcurrentHashMap.newKeySet();
     private final Set<ConnectionListener> connectionObservers = ConcurrentHashMap.newKeySet();
@@ -163,7 +163,7 @@ class EngineRunner {
         boolean forceRelaySetting = preferences.isConnectionForceRelayed();
 
         engineIsRunning = true;
-        activeForceRelaySetting = forceRelaySetting;
+        requestedForceRelaySetting = forceRelaySetting;
         Runnable r = () -> {
             DNSWatch dnsWatch = new DNSWatch(context);
             try {
@@ -197,7 +197,7 @@ class EngineRunner {
             } finally {
                 synchronized (EngineRunner.this) {
                     engineIsRunning = false;
-                    activeForceRelaySetting = null;
+                    requestedForceRelaySetting = null;
                 }
                 dnsWatch.removeDNSChangeListener();
                 notifyServiceStateListeners(false);
@@ -209,7 +209,7 @@ class EngineRunner {
             new Thread(r).start();
         } catch (RuntimeException e) {
             engineIsRunning = false;
-            activeForceRelaySetting = null;
+            requestedForceRelaySetting = null;
             throw e;
         }
     }
@@ -222,10 +222,10 @@ class EngineRunner {
         return engineIsRunning;
     }
 
-    public synchronized boolean isForceRelaySettingApplied(boolean enabled) {
+    public synchronized boolean isForceRelaySettingRequested(boolean enabled) {
         return engineIsRunning
-                && activeForceRelaySetting != null
-                && activeForceRelaySetting == enabled;
+                && requestedForceRelaySetting != null
+                && requestedForceRelaySetting == enabled;
     }
 
     public void setForceRelay(boolean enabled) {
@@ -237,10 +237,10 @@ class EngineRunner {
             goClient.setForceRelay(enabled);
             synchronized (this) {
                 if (engineIsRunning) {
-                    activeForceRelaySetting = enabled;
+                    requestedForceRelaySetting = enabled;
                 }
             }
-            Log.i(LOGTAG, "Applied runtime force-relay setting: " + enabled);
+            Log.i(LOGTAG, "Accepted runtime force-relay setting: " + enabled);
         } catch (Exception e) {
             Log.e(LOGTAG, "Failed to apply runtime force-relay setting", e);
             notifyError(e);

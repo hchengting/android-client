@@ -1,8 +1,8 @@
 # Runtime force-relay reconfiguration without an engine restart
 
-Status: phase 2 implemented. Open peers switch in place when an active path can
-be preserved, while the phase 1 recycle path remains as a fallback when no relay
-transport is ready. One-shot endpoint acceleration still protects that fallback.
+Status: phase 3 implemented for local transition safety. Open peers switch in
+place, and a peer without a ready relay remains on ICE in a pending force-relay
+state instead of recycling its transport run.
 
 ## Problem
 
@@ -26,7 +26,8 @@ control-plane clients.
 - Keep closed lazy peers closed and apply the latest value when they activate.
 - Coalesce rapid Android requests and perform Go calls off the main thread.
 - Preserve the environment variable as startup compatibility input.
-- Recover a peer's previous transport policy if applying a new policy fails.
+- Keep the requested policy distinct from the transport policy currently
+  applied to each peer.
 
 ## Interruption boundary
 
@@ -36,19 +37,15 @@ continues carrying traffic until the normal ICE upgrade path selects the new
 transport.
 
 Enabling force relay switches the WireGuard endpoint to an already-established
-relay before ICE is detached. If no relay proxy is ready, the implementation
-falls back to closing and recreating that peer's transport run. That uncommon
-fallback can still lose in-flight packets, but other peers and engine-owned
-subsystems remain running.
+relay before ICE is detached. If no relay proxy is ready, the peer records the
+request as pending, keeps the current peer context, handshaker, guard, ICE
+worker, proxy, WireGuard peer, endpoint, and ICE credentials, then asks the
+existing handshaker to negotiate again. The relay-ready callback completes the
+same transition after a usable relay proxy appears.
 
-For a normal responder connection, endpoint setup first clears the WireGuard
-endpoint and waits five seconds before programming the selected endpoint. That
-fallback lets the remote peer initiate a handshake, but it added an unconditional
-five-second gap after a runtime force-relay recycle. An in-place ICE addition and
-a fallback replacement program their first new endpoint immediately. This
-removes that local fallback delay; it does not guarantee that the first
-WireGuard handshake attempt will succeed, so a transport or handshake retry can
-still add latency.
+The normal responder endpoint fallback remains unchanged for ordinary
+connections. Runtime P2P-to-relay switching no longer enters that path merely
+because relay was not ready at the instant the setting changed.
 
 There is no engine-wide reconnect, Android VPN network replacement, route gap,
 or control-plane DNS bootstrap caused by a force-relay change.
@@ -77,19 +74,26 @@ Advanced UI / idle power event
  Engine.SetForceRelay()  -- serialized by syncMsgMux
         |                                  |
         v                                  v
- toggle SRWatcher ICE monitor       peer connection store
+ update SRWatcher base policy       peer connection store
                                            |
                      +---------------------+--------------------+
                      |                                          |
               open peer: switch in place                 closed lazy peer:
-              or use recycle fallback                   record policy only
+              or wait on ICE for relay                  record policy only
 ```
 
 `Engine` stores the requested policy atomically. New peer connections receive a
-snapshot of that value. Each existing connection also owns an atomic applied
-value, so a failed transition can keep reporting the policy its working
-transport still uses. No runtime path mutates process environment or a shared
-connection config.
+snapshot of that value. Each existing connection owns one atomic state rather
+than independent Boolean flags, so desired, applied, and pending observations
+cannot contradict one another:
+
+| Peer state | Desired force relay | Applied force relay | Meaning |
+| --- | --- | --- | --- |
+| `disabled` | no | no | ICE is allowed by the active or next run |
+| `pending` | yes | no | the existing ICE path stays active while relay is prepared |
+| `enabled` | yes | yes | relay-only policy is applied |
+
+No runtime path mutates process environment or a shared connection config.
 
 For an open peer, `Conn.ReconfigureForceRelay()` serializes against `Open()` and
 `Close()` and chooses one of three transitions:
@@ -98,15 +102,21 @@ For an open peer, `Conn.ReconfigureForceRelay()` serializes against `Open()` and
   publish it to the live handshaker, then advertise fresh ICE credentials;
 - force relay on with relay ready: resume the existing relay proxy, switch the
   WireGuard endpoint, stop advertising ICE, then retire the ICE worker and proxy;
-- force relay on without relay ready: use the phase 1 recycle path, including its
-  rollback behavior.
+- force relay on without relay ready: enter `pending`, preserve and continue
+  advertising ICE, and send an updated offer. When the relay-ready callback
+  arrives, switch the endpoint and retire ICE using the same ready-relay path.
+
+A pending request can be cancelled by turning force relay off. This changes the
+state back to `disabled` without replacing the already-active ICE worker.
 
 The in-place force-relay-off transition arms only the first ICE endpoint. The
 existing relay endpoint is not reconfigured. An in-place force-relay-on
-transition uses the established relay endpoint directly. Fallback replacement
-runs retain the per-transport one-shot mask from phase 1. Normal `Open()` and
+transition uses the established relay endpoint directly. Normal `Open()` and
 `OpenWithFirstPacket()` calls, plus later reconnect callbacks, continue to use
-the original responder fallback.
+the original responder fallback. Entering pending also arms the first relay
+endpoint update: it is consumed only if ICE disappears before relay becomes
+ready, so the now-disconnected peer does not add the responder delay before
+activating relay.
 
 This is a local peer-lifecycle and endpoint-programming change. It adds no signal
 field, wire protocol, or capability negotiation, so the remote peer does not
@@ -118,8 +128,16 @@ The retired ICE worker is unpublished before it is closed, so a delayed callback
 cannot mutate the relay-only state.
 
 `SRWatcher` keeps its signal and relay reconnect callbacks registered for the
-engine lifetime. Its ICE candidate monitor is stopped when force relay is on and
-started again when force relay is off.
+engine lifetime. Its ICE candidate monitor has both an engine base policy and
+per-peer requirements. Enabling force relay first lets peers acquire a monitor
+requirement when they enter `pending`, then disables the base policy; therefore
+the monitor cannot stop in the middle of a still-active ICE transition. It stops
+only after every pending peer has applied relay or cancelled the request.
+
+The guard classifies a pending peer with a connected ICE path as partially
+connected. It therefore performs bounded relay/capability probes while still
+treating the old path as usable. If ICE is also down, the peer is disconnected
+and retains the guard's aggressive retry behavior.
 
 ## Startup and request ordering
 
@@ -153,13 +171,35 @@ transition. Retired ICE resources are closed after releasing the peer mutex.
 
 If ICE construction fails, relay-only mode remains applied. If switching the
 endpoint to an established relay fails, the relay proxy is paused again and the
-working ICE policy, worker, proxy, and credentials remain intact. If the recycle
-fallback cannot open the requested policy, it restores the previous policy and
-attempts to reopen it. The engine aggregates errors from peers that could not
-apply the setting.
+working ICE policy, worker, proxy, and credentials remain intact while the peer
+remains pending. A failure reported synchronously is aggregated by the engine;
+an asynchronous relay-ready failure discards that relay proxy and lets the
+guard negotiate another one without dropping ICE.
 
-Android updates its applied-value snapshot only after the Go call succeeds. A
-failed call can therefore be retried by the next reconciliation event.
+Android records that the requested value was accepted after the Go call
+succeeds. For force-relay-on, successful acceptance may mean that one or more
+peers are still pending; the per-peer state remains the authority for actual
+transport application.
+
+## Logcat observability
+
+The transition logs distinguish request acceptance from per-peer application:
+
+- `force-relay runtime request updated to true` means the engine accepted the
+  desired value; it does not imply every peer already retired ICE;
+- `force-relay transition pending; keep ICE active until relay is ready` marks
+  the make-before-break waiting state and must not be accompanied by `close peer
+  connection` for that policy change;
+- `pending force-relay transition applied after relay became ready` confirms
+  callback-driven completion;
+- `force-relay transition applied using ready relay` confirms the immediate
+  ready-relay path;
+- `cancelled pending force-relay transition; keep ICE active` confirms that an
+  off request cancelled the wait without replacing the ICE run.
+
+On Android, `Accepted runtime force-relay setting` likewise means that Go
+accepted the requested policy. It intentionally does not claim that every peer
+has already reached relay-only state.
 
 ## Legacy cleanup boundary
 
@@ -183,14 +223,23 @@ Automated coverage verifies:
 - enabling force relay with an established relay switches its endpoint before
   retiring ICE and removes ICE credentials from later signaling;
 - a failed relay endpoint update leaves ICE active and advertised;
-- enabling force relay without a ready relay uses the recycle fallback;
+- enabling force relay without a ready relay preserves the peer run, ICE path,
+  endpoint, WireGuard peer, and credentials while marking the request pending;
+- a later relay-ready callback applies the pending request and only then retires
+  ICE;
+- the same callback completes relay-only mode if ICE is lost while waiting and
+  programs the first relay endpoint immediately;
+- cancelling a pending request preserves the existing ICE path;
 - the first new ICE endpoint bypasses responder fallback while the retained
   relay keeps its normal behavior;
 - a closed lazy peer remains closed and uses the new value on activation;
 - engine updates reach stored peers without starting closed peers;
 - a stopped or not-yet-started connect client queues the desired value;
 - the ICE monitor can be disabled and restarted without removing signal or
-  relay reconnect callbacks;
+  relay reconnect callbacks, and a pending peer requirement keeps it running
+  while the engine base policy is disabled;
+- guard status remains partially connected while pending ICE is usable and
+  becomes disconnected when that path is lost;
 - rapid Android requests coalesce to the latest value, including a request that
   arrives while another value is being applied;
 - touched Go packages pass focused race-detector tests;
@@ -213,7 +262,9 @@ Manual Android validation should additionally confirm:
 
 ## Future optimization
 
-The remaining recycle fallback can be replaced by a pending force-relay state
-that keeps ICE active until a relay connection becomes ready. A later phase can
-also wait for an observed WireGuard handshake on the target path before retiring
-the previous transport.
+The relay-ready callback proves that the relay transport and local proxy exist,
+but it does not prove that encrypted peer traffic has completed a WireGuard
+handshake on the new endpoint. A later phase can wait for an observed handshake
+or verified data-path activity on the target path before retiring the previous
+transport. That refinement is local for observation and rollback, although a
+fully coordinated make-before-break protocol would require remote-peer support.

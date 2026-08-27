@@ -38,11 +38,19 @@ engine-owned transport policy. The engine, Android VPN service, foreground
 lifecycle, TUN descriptor, routes, DNS, firewall, and control-plane sessions stay
 active.
 
-Open peers switch in place when an active path can be preserved. Disabling force
+Open peers switch in place while preserving their active path. Disabling force
 relay adds fresh ICE workers while relay stays active. Enabling it switches to an
-established relay before retiring ICE; peers without a ready relay use the
-per-peer recycle fallback. Closed lazy peers remain closed and use the new policy
-on their next activation.
+established relay before retiring ICE. A peer without a ready relay records the
+request as pending and continues using and advertising its existing ICE path;
+the relay-ready callback completes the switch without replacing the peer run or
+WireGuard peer. Closed lazy peers remain closed and use the new policy on their
+next activation.
+
+While any peer is pending, its per-peer requirement keeps ICE candidate
+monitoring active even though the engine's desired policy is relay-only. The
+connection guard treats a pending peer with working ICE as partially connected,
+which keeps bounded relay negotiation probes active without declaring the
+usable P2P path disconnected.
 
 Requests are serialized on a background executor and rapid changes are
 coalesced to the latest value. If the engine is stopped or still initializing,
