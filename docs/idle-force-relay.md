@@ -52,6 +52,11 @@ connection guard treats a pending peer with working ICE as partially connected,
 which keeps bounded relay negotiation probes active without declaring the
 usable P2P path disconnected.
 
+For devices connected to many peers, one policy request reconfigures at most
+eight peers concurrently. WireGuard device writes remain serialized by the
+interface lock, while peer-local stabilization waits and signaling overlap. The
+engine log includes the total fan-out duration for device-side comparison.
+
 Requests are serialized on a background executor and rapid changes are
 coalesced to the latest value. If the engine is stopped or still initializing,
 NetBird records the desired setting without starting the VPN; the next engine

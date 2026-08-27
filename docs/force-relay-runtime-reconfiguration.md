@@ -74,7 +74,7 @@ Advanced UI / idle power event
  Engine.SetForceRelay()  -- serialized by syncMsgMux
         |                                  |
         v                                  v
- update SRWatcher base policy       peer connection store
+ update SRWatcher base policy       bounded peer fan-out (max 8)
                                            |
                      +---------------------+--------------------+
                      |                                          |
@@ -161,7 +161,17 @@ latest desired value.
 
 `Engine.SetForceRelay()` takes `syncMsgMux`, the same serialization boundary used
 for engine lifecycle and network-map changes. This prevents peer creation or
-removal from interleaving with the store-wide policy update.
+removal from interleaving with the store-wide policy update. Requests remain
+serialized at the engine level, but one request reconfigures up to eight peers
+concurrently. Results are stored by peer-list position and errors are aggregated
+after every worker finishes, so completion order does not affect diagnostics.
+
+The shared `WGIface` mutex continues to serialize actual WireGuard device
+writes. Bounded fan-out instead overlaps peer-local lifecycle work, signaling,
+resource cleanup, and the 100 ms WireGuard stabilization workaround. For ready
+relay paths, this changes the dominant delay from one stabilization interval per
+peer to approximately one interval per batch of eight, plus serialized device
+writes. The bound prevents large accounts from creating one goroutine per peer.
 
 Each peer has a separate lifecycle mutex around open, close, and transport
 reconfiguration. The optional ICE worker is published through an atomic snapshot
@@ -185,8 +195,9 @@ transport application.
 
 The transition logs distinguish request acceptance from per-peer application:
 
-- `force-relay runtime request updated to true` means the engine accepted the
-  desired value; it does not imply every peer already retired ICE;
+- `force-relay runtime request updated to true; reconfigured ... in ...` means
+  the engine accepted the desired value and reports the bounded fan-out wall
+  time; it does not imply every pending peer already retired ICE;
 - `force-relay transition pending; keep ICE active until relay is ready` marks
   the make-before-break waiting state and must not be accompanied by `close peer
   connection` for that policy change;
@@ -234,6 +245,9 @@ Automated coverage verifies:
   relay keeps its normal behavior;
 - a closed lazy peer remains closed and uses the new value on activation;
 - engine updates reach stored peers without starting closed peers;
+- engine peer reconfiguration starts up to eight operations concurrently,
+  enforces that bound, counts successful changes, and preserves input order when
+  aggregating errors;
 - a stopped or not-yet-started connect client queues the desired value;
 - the ICE monitor can be disabled and restarted without removing signal or
   relay reconnect callbacks, and a pending peer requirement keeps it running
@@ -257,8 +271,10 @@ Manual Android validation should additionally confirm:
 5. Confirm a relay-to-ICE transition does not log peer removal or handshaker and
    guard shutdown, and its resulting transport mode matches the requested value.
 6. Repeat rapid on/off/on changes and confirm the final mode wins.
-7. Repeat with an idle lazy peer and confirm the setting does not activate it.
-8. Stop NetBird normally and confirm the VPN interface is removed.
+7. Repeat with at least nine active peers and compare the engine's `in ...`
+   duration with the prior sequential build; confirm peer transitions overlap.
+8. Repeat with an idle lazy peer and confirm the setting does not activate it.
+9. Stop NetBird normally and confirm the VPN interface is removed.
 
 ## Future optimization
 
