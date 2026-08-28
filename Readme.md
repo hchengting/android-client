@@ -32,6 +32,12 @@
 
 The NetBird Android client allows connections from mobile devices running Android to private resources in the NetBird network.
 
+## Power saving
+
+Force relay can be enabled automatically while Android is in device idle
+mode and kept active through Doze maintenance windows. See
+[Automatic force relay while the device is idle](docs/idle-force-relay.md).
+
 ## Screenshots
 
 <p align="center">

@@ -225,6 +225,8 @@
     <string name="advanced_theme_light">Light</string>
     <string name="advanced_force_relay_conn">Force relay connection</string>
     <string name="advanced_force_relay_conn_desc">Forces usage of relay when connecting to peers</string>
+    <string name="advanced_force_relay_on_device_idle">Force relay while device is idle</string>
+    <string name="advanced_force_relay_on_device_idle_desc">Automatically enables force relay in device idle mode and disables it after you unlock the device</string>
     <string name="exclamation_mark">exclamation mark</string>
     <string name="reconnectionNeededWarningMessage">To apply the setting, you will need to reconnect.</string>
     <string name="change_server_setup_key_warning">Using setup keys for user devices is not recommended. SSO with MFA provides stronger security, proper user-device association, and periodic re-authentication.</string>

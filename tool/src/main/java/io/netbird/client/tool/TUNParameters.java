@@ -1,12 +1,12 @@
 package io.netbird.client.tool;
 
 public class TUNParameters {
-    String address;
-    String addressV6;
-    long mtu;
-    String dns;
-    String searchDomainsString;
-    String routesString;
+    final String address;
+    final String addressV6;
+    final long mtu;
+    final String dns;
+    final String searchDomainsString;
+    final String routesString;
 
     public TUNParameters(String address, String addressV6, long mtu, String dns, String searchDomainsString, String routesString) {
         this.address = address;

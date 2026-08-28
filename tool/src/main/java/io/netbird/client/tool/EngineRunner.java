@@ -9,10 +9,13 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.netbird.gomobile.android.Android;
 import io.netbird.gomobile.android.Client;
 import io.netbird.gomobile.android.ConnectionListener;
+import io.netbird.gomobile.android.ControlPlaneResolver;
 import io.netbird.gomobile.android.DNSList;
 import io.netbird.gomobile.android.ErrListener;
 import io.netbird.gomobile.android.NetworkArray;
@@ -31,27 +34,40 @@ class EngineRunner {
     private final boolean isDebuggable;
     private final ProfileManagerWrapper profileManager;
     private boolean engineIsRunning = false;
+    private Boolean requestedForceRelaySetting;
     Set<ServiceStateListener> serviceStateListeners = ConcurrentHashMap.newKeySet();
     private final Set<Runnable> connectedObservers = ConcurrentHashMap.newKeySet();
     private final Set<ConnectionListener> connectionObservers = ConcurrentHashMap.newKeySet();
     private volatile SessionMonitor sessionMonitor;
     private final Client goClient;
     private ConnectionListener connectionListener;
+    private final ExecutorService forceRelayExecutor;
+    private final ForceRelayReconfigurationCoordinator forceRelayReconfigurationCoordinator;
 
     public EngineRunner(Context context, NetworkChangeListener networkChangeListener, TunAdapter tunAdapter,
                         IFaceDiscover iFaceDiscover, String versionName, boolean isTraceLogEnabled, boolean isDebuggable,
-                        ProfileManagerWrapper profileManager) {
+                        ProfileManagerWrapper profileManager, ControlPlaneResolver controlPlaneResolver) {
         this.context = context;
         this.isDebuggable = isDebuggable;
         this.profileManager = profileManager;
-
         goClient = Android.newClient(
                 androidSDKVersion(),
                 DeviceName.getDeviceName(),
                 versionName,
                 tunAdapter,
                 iFaceDiscover,
-                networkChangeListener);
+                networkChangeListener,
+                controlPlaneResolver);
+
+        forceRelayExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "NetBird-force-relay");
+            thread.setDaemon(true);
+            return thread;
+        });
+        forceRelayReconfigurationCoordinator = new ForceRelayReconfigurationCoordinator(
+                forceRelayExecutor,
+                this::applyForceRelaySetting
+        );
 
         updateLogLevel(isTraceLogEnabled, isDebuggable);
 
@@ -144,54 +160,58 @@ class EngineRunner {
         // update the log levels based on the up to date user settings
         Preferences preferences = new Preferences(context);
         updateLogLevel(preferences.isTraceLogEnabled(), isDebuggable);
+        boolean forceRelaySetting = preferences.isConnectionForceRelayed();
 
         engineIsRunning = true;
+        requestedForceRelaySetting = forceRelaySetting;
         Runnable r = () -> {
             DNSWatch dnsWatch = new DNSWatch(context);
-
-            var envList = EnvVarPackager.getEnvironmentVariables(preferences);
-
-            // Initialize engine with current active profile
-            // Get paths from Go ProfileManager instead of constructing them in Java
-            String configurationFilePath;
-            String stateFilePath;
             try {
-                configurationFilePath = profileManager.getActiveConfigPath();
-                stateFilePath = profileManager.getActiveStateFilePath();
+                var envList = EnvVarPackager.getEnvironmentVariables(forceRelaySetting);
+
+                String configurationFilePath = profileManager.getActiveConfigPath();
+                String stateFilePath = profileManager.getActiveStateFilePath();
                 Profile activeProfile = profileManager.getActiveProfile();
                 Log.d(LOGTAG, "Initializing engine with profile: " + activeProfile);
                 Log.d(LOGTAG, "Config path: " + configurationFilePath);
                 Log.d(LOGTAG, "State path: " + stateFilePath);
-            } catch (Exception e) {
-                Log.e(LOGTAG, "Failed to get profile paths from ProfileManager", e);
-                throw new RuntimeException("Failed to get profile paths: " + e.getMessage(), e);
-            }
 
-            // Create fresh PlatformFiles with current config/state paths
-            // This allows profile switching without recreating the entire Client
-            String cacheDir = context.getCacheDir().getAbsolutePath();
-            var platformFiles = new AndroidPlatformFiles(configurationFilePath, stateFilePath, cacheDir);
-            Log.d(LOGTAG, "Running engine with config: " + configurationFilePath + ", state: " + stateFilePath);
+                String cacheDir = context.getCacheDir().getAbsolutePath();
+                var platformFiles = new AndroidPlatformFiles(
+                        configurationFilePath, stateFilePath, cacheDir);
+                Log.d(LOGTAG, "Running engine with config: " + configurationFilePath
+                        + ", state: " + stateFilePath);
 
-            try {
                 notifyServiceStateListeners(true);
                 if (urlOpener == null) {
-                    goClient.runWithoutLogin(platformFiles, dnsWatch.dnsServers(), () -> dnsWatch.setDNSChangeListener(this::changed), envList);
+                    goClient.runWithoutLogin(platformFiles, dnsWatch.dnsServers(),
+                            () -> dnsWatch.setDNSChangeListener(this::changed), envList);
                 } else {
-                    goClient.run(platformFiles, urlOpener, isAndroidTV, dnsWatch.dnsServers(), () -> dnsWatch.setDNSChangeListener(this::changed), envList);
+                    goClient.run(platformFiles, urlOpener, isAndroidTV,
+                            dnsWatch.dnsServers(),
+                            () -> dnsWatch.setDNSChangeListener(this::changed), envList);
                 }
             } catch (Exception e) {
                 Log.e(LOGTAG, "goClient error", e);
                 notifyError(e);
             } finally {
-                engineIsRunning = false;
+                synchronized (EngineRunner.this) {
+                    engineIsRunning = false;
+                    requestedForceRelaySetting = null;
+                }
                 dnsWatch.removeDNSChangeListener();
                 notifyServiceStateListeners(false);
             }
             Log.e(LOGTAG, "service stopped");
 
         };
-        new Thread(r).start();
+        try {
+            new Thread(r).start();
+        } catch (RuntimeException e) {
+            engineIsRunning = false;
+            requestedForceRelaySetting = null;
+            throw e;
+        }
     }
 
     private void changed(DNSList dnsServers) throws Exception {
@@ -200,6 +220,36 @@ class EngineRunner {
 
     public synchronized boolean isRunning() {
         return engineIsRunning;
+    }
+
+    public synchronized boolean isForceRelaySettingRequested(boolean enabled) {
+        return engineIsRunning
+                && requestedForceRelaySetting != null
+                && requestedForceRelaySetting == enabled;
+    }
+
+    public void setForceRelay(boolean enabled) {
+        forceRelayReconfigurationCoordinator.request(enabled);
+    }
+
+    private void applyForceRelaySetting(boolean enabled) {
+        try {
+            goClient.setForceRelay(enabled);
+            synchronized (this) {
+                if (engineIsRunning) {
+                    requestedForceRelaySetting = enabled;
+                }
+            }
+            Log.i(LOGTAG, "Accepted runtime force-relay setting: " + enabled);
+        } catch (Exception e) {
+            Log.e(LOGTAG, "Failed to apply runtime force-relay setting", e);
+            notifyError(e);
+        }
+    }
+
+    public void shutdown() {
+        forceRelayReconfigurationCoordinator.close();
+        forceRelayExecutor.shutdownNow();
     }
 
     public synchronized void setConnectionListener(ConnectionListener listener) {

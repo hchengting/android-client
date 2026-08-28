@@ -1,6 +1,7 @@
 package io.netbird.client.tool;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
@@ -8,14 +9,18 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.Binder;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Parcel;
+import android.os.PowerManager;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
 
 import io.netbird.client.tool.networks.ConcreteNetworkAvailabilityListener;
 import io.netbird.client.tool.networks.NetworkChangeDetector;
+import io.netbird.client.tool.networks.UnderlyingNetworkResolver;
 import io.netbird.gomobile.android.Android;
 import io.netbird.gomobile.android.ConnectionListener;
 import io.netbird.gomobile.android.ErrListener;
@@ -30,6 +35,10 @@ public class VPNService extends android.net.VpnService {
     private final static String LOGTAG = "service";
     public static final String INTENT_ACTION_START = "io.netbird.client.intent.action.START_SERVICE";
     public static final String ACTION_STOP_ENGINE = "io.netbird.client.intent.action.STOP_ENGINE";
+    public static final String ACTION_APPLY_FORCE_RELAY_SETTING =
+            "io.netbird.client.intent.action.APPLY_FORCE_RELAY_SETTING";
+    public static final String ACTION_APPLY_IDLE_FORCE_RELAY_SETTING =
+            "io.netbird.client.intent.action.APPLY_IDLE_FORCE_RELAY_SETTING";
     // Launches MainActivity to run the interactive session-extend flow; set
     // on the persistent notification's "Extend session" action.
     public static final String ACTION_EXTEND_SESSION = "io.netbird.client.intent.action.EXTEND_SESSION";
@@ -42,7 +51,9 @@ public class VPNService extends android.net.VpnService {
     private static final String STATUS_SESSION_EXPIRED = "SessionExpired";
     private static final String STATUS_LOGIN_FAILED = "LoginFailed";
     private final IBinder myBinder = new MyLocalBinder();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private EngineRunner engineRunner;
+    private IFace iface;
     private ForegroundNotification fgNotification;
     private SessionNotification sessionNotification;
     private SessionMonitor sessionMonitor;
@@ -52,9 +63,11 @@ public class VPNService extends android.net.VpnService {
     private RouteChangeListener listener;
 
     private NetworkChangeDetector networkChangeDetector;
+    private UnderlyingNetworkResolver underlyingNetworkResolver;
     private ConcreteNetworkAvailabilityListener networkAvailabilityListener;
     private NetworkSwitchNotifier networkSwitchNotifier;
-    private android.content.BroadcastReceiver stopEngineReceiver;
+    private android.content.BroadcastReceiver engineCommandReceiver;
+    private android.content.BroadcastReceiver deviceIdleReceiver;
 
     @Override
     public void onCreate() {
@@ -62,7 +75,7 @@ public class VPNService extends android.net.VpnService {
         Log.d(LOGTAG, "onCreate");
 
         var versionName = Version.getVersionName(this);
-        var tunAdapter = new IFace(this);
+        iface = new IFace(this);
         var iFaceDiscover = new IFaceDiscover();
 
         listener = this::queueTUNRenewal;
@@ -78,8 +91,17 @@ public class VPNService extends android.net.VpnService {
         // Create foreground notification before initializing engine
         fgNotification = new ForegroundNotification(this);
 
-        engineRunner = new EngineRunner(this, notifier, tunAdapter, iFaceDiscover, versionName,
-                preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager);
+        ConnectivityManager connectivityManager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        underlyingNetworkResolver = new UnderlyingNetworkResolver(connectivityManager, mainHandler);
+        // Register before constructing the Go client so every control-plane
+        // lookup has a non-VPN Network provider from the first engine run.
+        underlyingNetworkResolver.register();
+
+        engineRunner = new EngineRunner(this, notifier, iface, iFaceDiscover, versionName,
+                preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager,
+                underlyingNetworkResolver);
+        reconcileIdleForceRelayOnServiceStart();
 
         // Session tracking lives here, in the service — the Android analogue
         // of the desktop daemon — so warnings and the expired notification
@@ -108,8 +130,7 @@ public class VPNService extends android.net.VpnService {
         networkSwitchNotifier = new NetworkSwitchNotifier(engineRunner);
         networkAvailabilityListener.subscribe(networkSwitchNotifier);
 
-        networkChangeDetector = new NetworkChangeDetector(
-                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE));
+        networkChangeDetector = new NetworkChangeDetector(connectivityManager);
         networkChangeDetector.subscribe(networkAvailabilityListener);
         networkChangeDetector.registerNetworkCallback();
         // Push the initial connectivity state into the Go client: transition
@@ -117,24 +138,80 @@ public class VPNService extends android.net.VpnService {
         // service starts while the device has no network (e.g. airplane mode).
         engineRunner.setNetworkAvailable(networkChangeDetector.hasInternetConnectivity());
 
-        // Register broadcast receiver for stopping engine (e.g., during profile switch)
-        stopEngineReceiver = new android.content.BroadcastReceiver() {
+        // Register app-internal engine commands while the VPN service is alive.
+        engineCommandReceiver = new android.content.BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 if (ACTION_STOP_ENGINE.equals(intent.getAction())) {
                     Log.d(LOGTAG, "Received stop engine broadcast");
-                    if (engineRunner != null) {
-                        engineRunner.stop();
-                    }
+                    stopEngine();
+                    return;
+                }
+                if (ACTION_APPLY_FORCE_RELAY_SETTING.equals(intent.getAction())) {
+                    Log.d(LOGTAG, "Received apply force-relay setting broadcast");
+                    reconcileRunningEngineWithStoredForceRelay();
+                    return;
+                }
+                if (ACTION_APPLY_IDLE_FORCE_RELAY_SETTING.equals(intent.getAction())) {
+                    Log.d(LOGTAG, "Received apply idle force-relay setting broadcast");
+                    reconcileIdleForceRelayAfterSettingChanged();
                 }
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_STOP_ENGINE);
+        filter.addAction(ACTION_APPLY_FORCE_RELAY_SETTING);
+        filter.addAction(ACTION_APPLY_IDLE_FORCE_RELAY_SETTING);
         androidx.core.content.ContextCompat.registerReceiver(
                 this,
-                stopEngineReceiver,
+                engineCommandReceiver,
                 filter,
-                Context.RECEIVER_NOT_EXPORTED
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        );
+
+        // Device idle exits for Doze maintenance windows are deliberately
+        // ignored. Force relay is disabled only after Android reports that the
+        // user is actually present beyond the keyguard.
+        deviceIdleReceiver = new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Preferences currentPreferences = new Preferences(VPNService.this);
+                if (!currentPreferences.isForceRelayOnDeviceIdleEnabled()) {
+                    return;
+                }
+
+                if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(intent.getAction())) {
+                    PowerManager powerManager = getSystemService(PowerManager.class);
+                    if (powerManager == null) {
+                        Log.w(LOGTAG, "PowerManager unavailable for idle force-relay update");
+                        return;
+                    }
+                    boolean deviceIdle = powerManager.isDeviceIdleMode();
+                    applyIdleForceRelayDecision(
+                            IdleForceRelayPolicy.onDeviceIdleModeChanged(
+                                    true, deviceIdle),
+                            deviceIdle
+                                    ? "device entered idle mode"
+                                    : "device idle exit ignored until user unlock"
+                    );
+                    return;
+                }
+
+                if (Intent.ACTION_USER_PRESENT.equals(intent.getAction())) {
+                    applyIdleForceRelayDecision(
+                            IdleForceRelayPolicy.onUserPresent(true),
+                            "user unlocked device"
+                    );
+                }
+            }
+        };
+        android.content.IntentFilter deviceIdleFilter = new android.content.IntentFilter(
+                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+        deviceIdleFilter.addAction(Intent.ACTION_USER_PRESENT);
+        androidx.core.content.ContextCompat.registerReceiver(
+                this,
+                deviceIdleReceiver,
+                deviceIdleFilter,
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
         );
     }
 
@@ -187,11 +264,18 @@ public class VPNService extends android.net.VpnService {
         Log.d(LOGTAG, "onDestroy");
 
         // Unregister broadcast receiver
-        if (stopEngineReceiver != null) {
+        if (engineCommandReceiver != null) {
             try {
-                unregisterReceiver(stopEngineReceiver);
+                unregisterReceiver(engineCommandReceiver);
             } catch (IllegalArgumentException e) {
                 Log.w(LOGTAG, "Receiver not registered", e);
+            }
+        }
+        if (deviceIdleReceiver != null) {
+            try {
+                unregisterReceiver(deviceIdleReceiver);
+            } catch (IllegalArgumentException e) {
+                Log.w(LOGTAG, "Device idle receiver not registered", e);
             }
         }
 
@@ -199,7 +283,9 @@ public class VPNService extends android.net.VpnService {
         networkChangeDetector.unsubscribe();
         networkChangeDetector.unregisterNetworkCallback();
 
+        engineRunner.shutdown();
         engineRunner.stop();
+        underlyingNetworkResolver.unregister();
         stopForeground(true);
 
         if (this.notifier != null) {
@@ -216,7 +302,7 @@ public class VPNService extends android.net.VpnService {
     public void onRevoke() {
         Log.d(LOGTAG, "VPN permission on revoke");
         if (engineRunner != null) {
-            engineRunner.stop();
+            stopEngine();
             stopForeground(true);
         }
     }
@@ -247,7 +333,7 @@ public class VPNService extends android.net.VpnService {
         }
 
         public void stopEngine() {
-            engineRunner.stop();
+            VPNService.this.stopEngine();
         }
 
         public boolean isRunning() {
@@ -455,15 +541,8 @@ public class VPNService extends android.net.VpnService {
 
         @Override
         public void onStopped() {
-            // Set before tearing the notification down: stopForeground can
-            // leave the notification on screen briefly (and does leave it when
-            // the service keeps running for a rebind), so it must not linger
-            // showing the connected icon.
-            //
-            // An expired session stops the engine right after onError, so keep
-            // the login prompt instead of overwriting it with a plain
-            // "Disconnected" — the Go side latches NeedsLogin until an actual
-            // login or extend clears it, so this stays true across the stop.
+            // The Go side latches NeedsLogin until a login or session
+            // extension clears it, so preserve that actionable state.
             fgNotification.setState(sessionMonitor.isLoginRequired()
                     ? ForegroundNotification.State.NEEDS_LOGIN
                     : ForegroundNotification.State.DISCONNECTED);
@@ -486,6 +565,85 @@ public class VPNService extends android.net.VpnService {
             fgNotification.stopForeground();
         }
     };
+
+    private void stopEngine() {
+        if (engineRunner != null) {
+            engineRunner.stop();
+        }
+    }
+
+    private void reconcileIdleForceRelayOnServiceStart() {
+        Preferences preferences = new Preferences(this);
+        if (!preferences.isForceRelayOnDeviceIdleEnabled()) {
+            return;
+        }
+
+        PowerManager powerManager = getSystemService(PowerManager.class);
+        KeyguardManager keyguardManager = getSystemService(KeyguardManager.class);
+        if (powerManager == null || keyguardManager == null) {
+            Log.w(LOGTAG, "Unable to resolve idle force-relay state on service start");
+            return;
+        }
+
+        applyIdleForceRelayDecision(
+                IdleForceRelayPolicy.onServiceStarted(
+                        true,
+                        powerManager.isDeviceIdleMode(),
+                        powerManager.isInteractive(),
+                        keyguardManager.isKeyguardLocked()),
+                "VPN service started"
+        );
+    }
+
+    private void reconcileIdleForceRelayAfterSettingChanged() {
+        Preferences preferences = new Preferences(this);
+        boolean automaticModeEnabled = preferences.isForceRelayOnDeviceIdleEnabled();
+        PowerManager powerManager = getSystemService(PowerManager.class);
+        KeyguardManager keyguardManager = getSystemService(KeyguardManager.class);
+        if (powerManager == null || keyguardManager == null) {
+            Log.w(LOGTAG, "Unable to apply idle force-relay setting");
+            if (!automaticModeEnabled) {
+                applyIdleForceRelayDecision(IdleForceRelayPolicy.Decision.DISABLE,
+                        "idle automatic mode disabled");
+            }
+            return;
+        }
+
+        applyIdleForceRelayDecision(
+                IdleForceRelayPolicy.onAutomaticModeChanged(
+                        automaticModeEnabled,
+                        powerManager.isDeviceIdleMode(),
+                        powerManager.isInteractive(),
+                        keyguardManager.isKeyguardLocked()),
+                automaticModeEnabled
+                        ? "idle automatic mode enabled"
+                        : "idle automatic mode disabled"
+        );
+    }
+
+    private void applyIdleForceRelayDecision(IdleForceRelayPolicy.Decision decision,
+                                             String reason) {
+        if (decision == IdleForceRelayPolicy.Decision.KEEP) {
+            Log.d(LOGTAG, "Keeping force-relay setting: " + reason);
+            return;
+        }
+
+        boolean enabled = decision == IdleForceRelayPolicy.Decision.ENABLE;
+        Preferences preferences = new Preferences(this);
+        boolean changed = preferences.setConnectionForceRelayed(enabled);
+        Log.i(LOGTAG, "Idle force relay " + (enabled ? "enabled" : "disabled")
+                + ": " + reason + (changed ? "" : " (preference unchanged)"));
+        reconcileRunningEngineWithStoredForceRelay();
+    }
+
+    private void reconcileRunningEngineWithStoredForceRelay() {
+        boolean enabled = new Preferences(this).isConnectionForceRelayed();
+        if (engineRunner.isForceRelaySettingRequested(enabled)) {
+            Log.d(LOGTAG, "Force-relay setting is already requested");
+            return;
+        }
+        engineRunner.setForceRelay(enabled);
+    }
 
     private TUNCreatorLooperThread tunCreator;
 
@@ -517,7 +675,6 @@ public class VPNService extends android.net.VpnService {
             return;
         }
 
-        var iface = new IFace(VPNService.this);
         try {
             int fd = (int)iface.configureInterface(
                     currentTUNParameters.address,
