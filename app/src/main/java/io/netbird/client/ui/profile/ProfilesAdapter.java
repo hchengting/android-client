@@ -3,12 +3,13 @@ package io.netbird.client.ui.profile;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
+
+import com.google.android.material.button.MaterialButton;
 
 import java.util.List;
 
@@ -17,11 +18,15 @@ import io.netbird.client.tool.Profile;
 
 public class ProfilesAdapter extends RecyclerView.Adapter<ProfilesAdapter.ProfileViewHolder> {
 
+    /** ID of the built-in profile, which cannot be removed. Must match the Go core. */
+    static final String DEFAULT_PROFILE_ID = "default";
+
     private final List<Profile> profiles;
     private final ProfileActionListener listener;
 
     public interface ProfileActionListener {
         void onSwitchProfile(Profile profile);
+        void onEditProfile(Profile profile);
         void onLogoutProfile(Profile profile);
         void onRemoveProfile(Profile profile);
     }
@@ -52,15 +57,19 @@ public class ProfilesAdapter extends RecyclerView.Adapter<ProfilesAdapter.Profil
 
     static class ProfileViewHolder extends RecyclerView.ViewHolder {
         private final TextView textName;
+        private final TextView textEmail;
         private final TextView badgeActive;
-        private final Button btnSwitch;
-        private final Button btnLogout;
-        private final Button btnRemove;
+        private final ImageView btnRename;
+        private final MaterialButton btnSwitch;
+        private final MaterialButton btnLogout;
+        private final MaterialButton btnRemove;
 
         public ProfileViewHolder(@NonNull View itemView) {
             super(itemView);
             textName = itemView.findViewById(R.id.text_profile_name);
+            textEmail = itemView.findViewById(R.id.text_profile_email);
             badgeActive = itemView.findViewById(R.id.badge_active);
+            btnRename = itemView.findViewById(R.id.btn_rename);
             btnSwitch = itemView.findViewById(R.id.btn_switch);
             btnLogout = itemView.findViewById(R.id.btn_logout);
             btnRemove = itemView.findViewById(R.id.btn_remove);
@@ -68,6 +77,14 @@ public class ProfilesAdapter extends RecyclerView.Adapter<ProfilesAdapter.Profil
 
         public void bind(Profile profile, ProfileActionListener listener) {
             textName.setText(profile.getName());
+
+            String email = profile.getEmail();
+            if (email == null || email.isEmpty()) {
+                textEmail.setVisibility(View.GONE);
+            } else {
+                textEmail.setText(email);
+                textEmail.setVisibility(View.VISIBLE);
+            }
 
             if (profile.isActive()) {
                 badgeActive.setVisibility(View.VISIBLE);
@@ -79,14 +96,12 @@ public class ProfilesAdapter extends RecyclerView.Adapter<ProfilesAdapter.Profil
                 btnSwitch.setText(R.string.profiles_switch);
             }
 
-            // Disable remove for default profile
-            if (profile.getName().equals("default")) {
-                btnRemove.setEnabled(false);
-                btnRemove.setAlpha(0.5f);
-            } else {
-                btnRemove.setEnabled(true);
-                btnRemove.setAlpha(1.0f);
-            }
+            // Disable remove for the default profile. Keyed on ID, not name: the
+            // name is user-editable and no longer identifies the default profile.
+            // The button's text colour selector already dims the disabled state.
+            btnRemove.setEnabled(!DEFAULT_PROFILE_ID.equals(profile.getID()));
+
+            btnRename.setOnClickListener(v -> listener.onEditProfile(profile));
 
             btnSwitch.setOnClickListener(v -> {
                 if (!profile.isActive()) {
@@ -99,7 +114,7 @@ public class ProfilesAdapter extends RecyclerView.Adapter<ProfilesAdapter.Profil
             });
 
             btnRemove.setOnClickListener(v -> {
-                if (!profile.getName().equals("default")) {
+                if (!DEFAULT_PROFILE_ID.equals(profile.getID())) {
                     listener.onRemoveProfile(profile);
                 }
             });
