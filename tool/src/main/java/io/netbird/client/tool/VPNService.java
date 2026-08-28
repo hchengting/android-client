@@ -20,6 +20,7 @@ import androidx.annotation.Nullable;
 
 import io.netbird.client.tool.networks.ConcreteNetworkAvailabilityListener;
 import io.netbird.client.tool.networks.NetworkChangeDetector;
+import io.netbird.client.tool.networks.UnderlyingNetworkResolver;
 import io.netbird.gomobile.android.Android;
 import io.netbird.gomobile.android.ConnectionListener;
 import io.netbird.gomobile.android.ErrListener;
@@ -62,6 +63,7 @@ public class VPNService extends android.net.VpnService {
     private RouteChangeListener listener;
 
     private NetworkChangeDetector networkChangeDetector;
+    private UnderlyingNetworkResolver underlyingNetworkResolver;
     private ConcreteNetworkAvailabilityListener networkAvailabilityListener;
     private NetworkSwitchNotifier networkSwitchNotifier;
     private android.content.BroadcastReceiver engineCommandReceiver;
@@ -89,8 +91,16 @@ public class VPNService extends android.net.VpnService {
         // Create foreground notification before initializing engine
         fgNotification = new ForegroundNotification(this);
 
+        ConnectivityManager connectivityManager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        underlyingNetworkResolver = new UnderlyingNetworkResolver(connectivityManager, mainHandler);
+        // Register before constructing the Go client so every control-plane
+        // lookup has a non-VPN Network provider from the first engine run.
+        underlyingNetworkResolver.register();
+
         engineRunner = new EngineRunner(this, notifier, iface, iFaceDiscover, versionName,
-                preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager);
+                preferences.isTraceLogEnabled(), Version.isDebuggable(this), profileManager,
+                underlyingNetworkResolver);
         engineRestartCoordinator = new EngineRestartCoordinator(
                 engineRunner::isRunning,
                 engineRunner::stopPreservingTun
@@ -124,8 +134,7 @@ public class VPNService extends android.net.VpnService {
         networkSwitchNotifier = new NetworkSwitchNotifier(engineRunner);
         networkAvailabilityListener.subscribe(networkSwitchNotifier);
 
-        networkChangeDetector = new NetworkChangeDetector(
-                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE));
+        networkChangeDetector = new NetworkChangeDetector(connectivityManager);
         networkChangeDetector.subscribe(networkAvailabilityListener);
         networkChangeDetector.registerNetworkCallback();
         // Push the initial connectivity state into the Go client: transition
@@ -278,6 +287,7 @@ public class VPNService extends android.net.VpnService {
         networkChangeDetector.unregisterNetworkCallback();
 
         engineRunner.stop();
+        underlyingNetworkResolver.unregister();
         stopForeground(true);
 
         if (this.notifier != null) {
