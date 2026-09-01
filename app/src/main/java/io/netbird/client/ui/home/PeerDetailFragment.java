@@ -38,6 +38,7 @@ import io.netbird.client.R;
 import io.netbird.client.ServiceAccessor;
 import io.netbird.client.StateListenerRegistry;
 import io.netbird.client.databinding.FragmentPeerDetailBinding;
+import io.netbird.client.ui.ssh.SshConnectDialog;
 
 /**
  * Full-screen view of everything the client knows about one peer. Mirrors the
@@ -203,6 +204,8 @@ public class PeerDetailFragment extends Fragment {
     private void render(Peer peer) {
         binding.peerDetailFqdn.setText(peer.getFqdn());
         binding.peerDetailStatusDot.setBackgroundResource(statusDot(peer.getStatus()));
+        binding.peerDetailSsh.setOnClickListener(v -> SshConnectDialog.show(requireContext(),
+                peer.getIp(), getString(R.string.ssh_dialog_title, peer.getFqdn())));
 
         LinearLayout rows = binding.peerDetailRows;
         rows.removeAllViews();
@@ -272,7 +275,15 @@ public class PeerDetailFragment extends Fragment {
         View header = inflater.inflate(R.layout.list_item_peer_detail_header, rows, false);
         ((ImageView) header.findViewById(R.id.peer_detail_header_icon)).setImageResource(icon);
         ((TextView) header.findViewById(R.id.peer_detail_header_text)).setText(label);
-        rows.addView(header);
+        addSeparated(inflater, rows, header);
+    }
+
+    /** Every list element after the first gets a separator line above it. */
+    private void addSeparated(LayoutInflater inflater, LinearLayout rows, View view) {
+        if (rows.getChildCount() > 0) {
+            inflater.inflate(R.layout.list_item_setting_divider, rows, true);
+        }
+        rows.addView(view);
     }
 
     /** Skipped entirely when neither the type nor the endpoint is known, as on desktop. */
@@ -324,7 +335,7 @@ public class PeerDetailFragment extends Fragment {
             row.setClickable(false);
         }
 
-        rows.addView(row);
+        addSeparated(inflater, rows, row);
         return row;
     }
 
@@ -337,7 +348,7 @@ public class PeerDetailFragment extends Fragment {
         ((TextView) row.findViewById(R.id.peer_detail_bytes_tx))
                 .setText(Formatter.formatFileSize(context, peer.getBytesTx()));
 
-        rows.addView(row);
+        addSeparated(inflater, rows, row);
     }
 
     @ColorRes
